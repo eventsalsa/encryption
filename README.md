@@ -1,4 +1,4 @@
-# encryption
+# eventsalsa/encryption
 
 Envelope encryption for event-sourced Go systems — with PII crypto-shredding and secret key rotation.
 
