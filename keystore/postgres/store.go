@@ -26,6 +26,21 @@ type Config struct {
 	Table  string
 }
 
+const (
+	// DefaultSchema is the default PostgreSQL schema for encryption keys.
+	DefaultSchema = "infrastructure"
+	// DefaultTable is the default PostgreSQL table name for encryption keys.
+	DefaultTable = "encryption_keys"
+)
+
+// DefaultConfig returns the default PostgreSQL keystore configuration.
+func DefaultConfig() Config {
+	return Config{
+		Schema: DefaultSchema,
+		Table:  DefaultTable,
+	}
+}
+
 // Store implements keystore.KeyStore backed by PostgreSQL.
 type Store struct {
 	cfg     Config
@@ -33,12 +48,13 @@ type Store struct {
 	extract TxExtractor
 }
 
-func applyDefaults(cfg Config) Config {
+// ApplyDefaults fills in the default schema and table names when omitted.
+func ApplyDefaults(cfg Config) Config {
 	if cfg.Schema == "" {
-		cfg.Schema = "infrastructure"
+		cfg.Schema = DefaultSchema
 	}
 	if cfg.Table == "" {
-		cfg.Table = "encryption_keys"
+		cfg.Table = DefaultTable
 	}
 	return cfg
 }
@@ -48,7 +64,7 @@ func applyDefaults(cfg Config) Config {
 // Reads use the connection pool. Writes auto-commit via *sql.DB.
 // Use keystore.WithTx(ctx, tx) to opt into transaction participation.
 func NewStore(cfg Config, db *sql.DB) *Store {
-	return &Store{cfg: applyDefaults(cfg), db: db}
+	return &Store{cfg: ApplyDefaults(cfg), db: db}
 }
 
 // NewStoreWithTxExtractor creates a store with a custom tx extractor.
@@ -57,7 +73,7 @@ func NewStore(cfg Config, db *sql.DB) *Store {
 // Use this for Unit of Work patterns where *sql.Tx lives under your
 // own context key rather than the library's keystore.WithTx key.
 func NewStoreWithTxExtractor(cfg Config, db *sql.DB, extract TxExtractor) *Store {
-	return &Store{cfg: applyDefaults(cfg), db: db, extract: extract}
+	return &Store{cfg: ApplyDefaults(cfg), db: db, extract: extract}
 }
 
 // conn resolves the active database handle for this context.

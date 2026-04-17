@@ -9,6 +9,7 @@ Envelope encryption for event-sourced Go systems — with PII crypto-shredding a
 - **Secret encryption** — versioned keys with rotation (old ciphertext stays decryptable)
 - **Pluggable cipher** — ships AES-256-GCM, bring your own `cipher.Cipher`
 - **Pluggable key store** — ships PostgreSQL adapter, bring your own `keystore.KeyStore`
+- **Migration CLI** — `cmd/migrate-gen` generates or prints the PostgreSQL keystore migration
 - **Deterministic hashing** — HMAC-SHA256 for generating aggregate IDs from sensitive data
 - **Memory hygiene** — DEKs are zeroed after use via `ZeroBytes`
 - **Zero external dependencies** — only Go standard library
@@ -19,7 +20,38 @@ The library ships a PostgreSQL-backed key store. You need three things to get go
 
 ### Migration
 
-The `keystore/postgres/migrations` package embeds the SQL migration. Apply it to your database before using the store — either by executing it directly or by feeding it to your migration tool:
+Generate the PostgreSQL key-store migration through the stable CLI entrypoint:
+
+```bash
+go run github.com/eventsalsa/encryption/cmd/migrate-gen -output migrations
+# writes migrations/20260417123456_init_encryption_keys.sql
+```
+
+You can print the SQL directly when piping into your own tooling:
+
+```bash
+go run github.com/eventsalsa/encryption/cmd/migrate-gen -stdout
+go run github.com/eventsalsa/encryption/cmd/migrate-gen -schema custom_schema -table custom_keys -stdout
+```
+
+For advanced package-level usage, `keystore/postgres/migrations` can render the SQL directly with the same schema and table overrides used by `postgres.Config`:
+
+```go
+import (
+	"github.com/eventsalsa/encryption/keystore/postgres"
+	"github.com/eventsalsa/encryption/keystore/postgres/migrations"
+)
+
+sql, err := migrations.SQL(postgres.Config{
+	Schema: "custom_schema",
+	Table:  "custom_keys",
+})
+if err != nil {
+	// handle error
+}
+```
+
+The raw embedded default migration is also available if you want the exact shipped SQL without any overrides:
 
 ```sql
 CREATE TABLE IF NOT EXISTS infrastructure.encryption_keys (
