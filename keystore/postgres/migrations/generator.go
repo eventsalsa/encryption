@@ -72,7 +72,7 @@ func GeneratePostgres(config *Config) error {
 		return err
 	}
 
-	if err := os.MkdirAll(config.OutputFolder, 0o755); err != nil {
+	if err := os.MkdirAll(config.OutputFolder, 0o750); err != nil {
 		return fmt.Errorf("create output folder: %w", err)
 	}
 
