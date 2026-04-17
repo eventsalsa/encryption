@@ -3,6 +3,7 @@
 package postgres_test
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"errors"
@@ -11,10 +12,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/eventsalsa/encryption/cipher/aesgcm"
 	encryption "github.com/eventsalsa/encryption/encerr"
+	"github.com/eventsalsa/encryption/envelope"
 	"github.com/eventsalsa/encryption/keystore"
 	"github.com/eventsalsa/encryption/keystore/postgres"
 	"github.com/eventsalsa/encryption/keystore/postgres/migrations"
+	"github.com/eventsalsa/encryption/systemkey"
 
 	_ "github.com/lib/pq"
 	"github.com/testcontainers/testcontainers-go"
@@ -70,6 +74,28 @@ func setupPostgres(t *testing.T) *sql.DB {
 	}
 
 	return db
+}
+
+func mustStoreEncryptedKey(t *testing.T, store *postgres.Store, ctx context.Context, c *aesgcm.Cipher, systemKey []byte, systemKeyID, scope, scopeID string, version int, dek []byte) {
+	t.Helper()
+
+	encryptedDEK, err := c.Encrypt(systemKey, dek)
+	if err != nil {
+		t.Fatalf("encrypt DEK: %v", err)
+	}
+	if err := store.CreateKey(ctx, scope, scopeID, version, encryptedDEK, systemKeyID); err != nil {
+		t.Fatalf("CreateKey: %v", err)
+	}
+}
+
+func mustDecryptDEK(t *testing.T, c *aesgcm.Cipher, systemKey []byte, encryptedDEK []byte) []byte {
+	t.Helper()
+
+	dek, err := c.Decrypt(systemKey, encryptedDEK)
+	if err != nil {
+		t.Fatalf("decrypt DEK: %v", err)
+	}
+	return dek
 }
 
 // ---------------------------------------------------------------------------
@@ -551,5 +577,342 @@ func TestMigrationIdempotent(t *testing.T) {
 	// Apply migration a second time — should not fail due to IF NOT EXISTS.
 	if _, err := db.ExecContext(ctx, string(migration)); err != nil {
 		t.Fatalf("re-applying migration should be idempotent: %v", err)
+	}
+}
+
+func TestRewrapSystemKeys_RewrapsMatchingRows(t *testing.T) {
+	db := setupPostgres(t)
+	store := postgres.NewStore(postgres.Config{}, db)
+	ctx := context.Background()
+	c := aesgcm.New()
+
+	oldKey := makeSystemKey(10)
+	newKey := makeSystemKey(100)
+	keyring := systemkey.NewKeyring(map[string][]byte{
+		"old": oldKey,
+		"new": newKey,
+	}, "new")
+
+	oldActiveDEK := []byte("0123456789abcdef0123456789abcdef")
+	oldRevokedDEK := []byte("abcdef0123456789abcdef0123456789")
+	piiDEK := []byte("fedcba9876543210fedcba9876543210")
+	alreadyNewDEK := []byte("00112233445566778899aabbccddeeff")
+
+	mustStoreEncryptedKey(t, store, ctx, c, oldKey, "old", "secret", "stripe", 1, oldRevokedDEK)
+	mustStoreEncryptedKey(t, store, ctx, c, oldKey, "old", "secret", "stripe", 2, oldActiveDEK)
+	if err := store.RevokeKeys(ctx, "secret", "stripe"); err != nil {
+		t.Fatalf("RevokeKeys: %v", err)
+	}
+	mustStoreEncryptedKey(t, store, ctx, c, oldKey, "old", "pii", "user-1", 1, piiDEK)
+	mustStoreEncryptedKey(t, store, ctx, c, newKey, "new", "secret", "already-new", 1, alreadyNewDEK)
+
+	unchangedBefore, err := store.GetKey(ctx, "secret", "already-new", 1)
+	if err != nil {
+		t.Fatalf("GetKey already-new before rewrap: %v", err)
+	}
+
+	result, err := store.RewrapSystemKeys(ctx, keyring, c, postgres.RewrapSystemKeysOptions{
+		FromSystemKeyID: "old",
+		ToSystemKeyID:   "new",
+		BatchSize:       1,
+	})
+	if err != nil {
+		t.Fatalf("RewrapSystemKeys: %v", err)
+	}
+	if result.MatchedRows != 3 {
+		t.Fatalf("MatchedRows = %d, want 3", result.MatchedRows)
+	}
+	if result.RewrappedRows != 3 {
+		t.Fatalf("RewrappedRows = %d, want 3", result.RewrappedRows)
+	}
+	if result.SkippedRows != 0 {
+		t.Fatalf("SkippedRows = %d, want 0", result.SkippedRows)
+	}
+	if result.RemainingRows != 0 {
+		t.Fatalf("RemainingRows = %d, want 0", result.RemainingRows)
+	}
+	if result.Batches != 3 {
+		t.Fatalf("Batches = %d, want 3", result.Batches)
+	}
+
+	oldRevoked, err := store.GetKey(ctx, "secret", "stripe", 1)
+	if err != nil {
+		t.Fatalf("GetKey secret/stripe v1: %v", err)
+	}
+	if oldRevoked.SystemKeyID != "new" {
+		t.Fatalf("system key v1 = %q, want %q", oldRevoked.SystemKeyID, "new")
+	}
+	if oldRevoked.RevokedAt == nil {
+		t.Fatal("revoked key should remain revoked")
+	}
+	if got := mustDecryptDEK(t, c, newKey, oldRevoked.EncryptedDEK); !bytes.Equal(got, oldRevokedDEK) {
+		t.Fatalf("v1 DEK mismatch: got %x want %x", got, oldRevokedDEK)
+	}
+
+	oldActive, err := store.GetKey(ctx, "secret", "stripe", 2)
+	if err != nil {
+		t.Fatalf("GetKey secret/stripe v2: %v", err)
+	}
+	if oldActive.SystemKeyID != "new" {
+		t.Fatalf("system key v2 = %q, want %q", oldActive.SystemKeyID, "new")
+	}
+	if got := mustDecryptDEK(t, c, newKey, oldActive.EncryptedDEK); !bytes.Equal(got, oldActiveDEK) {
+		t.Fatalf("v2 DEK mismatch: got %x want %x", got, oldActiveDEK)
+	}
+
+	piiKey, err := store.GetKey(ctx, "pii", "user-1", 1)
+	if err != nil {
+		t.Fatalf("GetKey pii/user-1 v1: %v", err)
+	}
+	if piiKey.SystemKeyID != "new" {
+		t.Fatalf("pii system key = %q, want %q", piiKey.SystemKeyID, "new")
+	}
+	if got := mustDecryptDEK(t, c, newKey, piiKey.EncryptedDEK); !bytes.Equal(got, piiDEK) {
+		t.Fatalf("pii DEK mismatch: got %x want %x", got, piiDEK)
+	}
+
+	unchangedAfter, err := store.GetKey(ctx, "secret", "already-new", 1)
+	if err != nil {
+		t.Fatalf("GetKey already-new after rewrap: %v", err)
+	}
+	if unchangedAfter.SystemKeyID != "new" {
+		t.Fatalf("already-new system key = %q, want %q", unchangedAfter.SystemKeyID, "new")
+	}
+	if !bytes.Equal(unchangedAfter.EncryptedDEK, unchangedBefore.EncryptedDEK) {
+		t.Fatal("already-new row should not be rewritten")
+	}
+}
+
+func TestRewrapSystemKeys_DryRun(t *testing.T) {
+	db := setupPostgres(t)
+	store := postgres.NewStore(postgres.Config{}, db)
+	ctx := context.Background()
+	c := aesgcm.New()
+
+	oldKey := makeSystemKey(20)
+	newKey := makeSystemKey(120)
+	keyring := systemkey.NewKeyring(map[string][]byte{
+		"old": oldKey,
+		"new": newKey,
+	}, "new")
+
+	dek := []byte("11223344556677889900aabbccddeeff")
+	mustStoreEncryptedKey(t, store, ctx, c, oldKey, "old", "secret", "dry-run", 1, dek)
+
+	before, err := store.GetKey(ctx, "secret", "dry-run", 1)
+	if err != nil {
+		t.Fatalf("GetKey before dry-run: %v", err)
+	}
+
+	result, err := store.RewrapSystemKeys(ctx, keyring, c, postgres.RewrapSystemKeysOptions{
+		FromSystemKeyID: "old",
+		ToSystemKeyID:   "new",
+		DryRun:          true,
+	})
+	if err != nil {
+		t.Fatalf("RewrapSystemKeys dry-run: %v", err)
+	}
+	if result.MatchedRows != 1 {
+		t.Fatalf("MatchedRows = %d, want 1", result.MatchedRows)
+	}
+	if result.RewrappedRows != 0 {
+		t.Fatalf("RewrappedRows = %d, want 0", result.RewrappedRows)
+	}
+	if result.RemainingRows != 1 {
+		t.Fatalf("RemainingRows = %d, want 1", result.RemainingRows)
+	}
+	if result.Batches != 0 {
+		t.Fatalf("Batches = %d, want 0", result.Batches)
+	}
+
+	after, err := store.GetKey(ctx, "secret", "dry-run", 1)
+	if err != nil {
+		t.Fatalf("GetKey after dry-run: %v", err)
+	}
+	if after.SystemKeyID != "old" {
+		t.Fatalf("system key after dry-run = %q, want %q", after.SystemKeyID, "old")
+	}
+	if !bytes.Equal(after.EncryptedDEK, before.EncryptedDEK) {
+		t.Fatal("dry-run should not modify ciphertext")
+	}
+}
+
+func TestRewrapSystemKeys_Idempotent(t *testing.T) {
+	db := setupPostgres(t)
+	store := postgres.NewStore(postgres.Config{}, db)
+	ctx := context.Background()
+	c := aesgcm.New()
+
+	oldKey := makeSystemKey(30)
+	newKey := makeSystemKey(130)
+	keyring := systemkey.NewKeyring(map[string][]byte{
+		"old": oldKey,
+		"new": newKey,
+	}, "new")
+
+	dek := []byte("ffeeddccbbaa00998877665544332211")
+	mustStoreEncryptedKey(t, store, ctx, c, oldKey, "old", "secret", "idempotent", 1, dek)
+
+	first, err := store.RewrapSystemKeys(ctx, keyring, c, postgres.RewrapSystemKeysOptions{
+		FromSystemKeyID: "old",
+		ToSystemKeyID:   "new",
+	})
+	if err != nil {
+		t.Fatalf("first RewrapSystemKeys: %v", err)
+	}
+	if first.RewrappedRows != 1 {
+		t.Fatalf("first RewrappedRows = %d, want 1", first.RewrappedRows)
+	}
+	if first.RemainingRows != 0 {
+		t.Fatalf("first RemainingRows = %d, want 0", first.RemainingRows)
+	}
+
+	second, err := store.RewrapSystemKeys(ctx, keyring, c, postgres.RewrapSystemKeysOptions{
+		FromSystemKeyID: "old",
+		ToSystemKeyID:   "new",
+	})
+	if err != nil {
+		t.Fatalf("second RewrapSystemKeys: %v", err)
+	}
+	if second.MatchedRows != 0 {
+		t.Fatalf("second MatchedRows = %d, want 0", second.MatchedRows)
+	}
+	if second.RewrappedRows != 0 {
+		t.Fatalf("second RewrappedRows = %d, want 0", second.RewrappedRows)
+	}
+	if second.RemainingRows != 0 {
+		t.Fatalf("second RemainingRows = %d, want 0", second.RemainingRows)
+	}
+}
+
+func TestRewrapSystemKeys_ConcurrentRuns(t *testing.T) {
+	db := setupPostgres(t)
+	store := postgres.NewStore(postgres.Config{}, db)
+	ctx := context.Background()
+	c := aesgcm.New()
+
+	oldKey := makeSystemKey(40)
+	newKey := makeSystemKey(140)
+	keyring := systemkey.NewKeyring(map[string][]byte{
+		"old": oldKey,
+		"new": newKey,
+	}, "new")
+
+	for i := 0; i < 10; i++ {
+		scopeID := fmt.Sprintf("concurrent-%d", i)
+		dek := []byte(fmt.Sprintf("%032d", i))
+		mustStoreEncryptedKey(t, store, ctx, c, oldKey, "old", "secret", scopeID, 1, dek)
+	}
+
+	results := make([]postgres.RewrapSystemKeysResult, 2)
+	errs := make([]error, 2)
+	var wg sync.WaitGroup
+
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			results[i], errs[i] = store.RewrapSystemKeys(ctx, keyring, c, postgres.RewrapSystemKeysOptions{
+				FromSystemKeyID: "old",
+				ToSystemKeyID:   "new",
+				BatchSize:       1,
+			})
+		}(i)
+	}
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("run %d: %v", i, err)
+		}
+	}
+
+	totalRewrapped := results[0].RewrappedRows + results[1].RewrappedRows
+	if totalRewrapped != 10 {
+		t.Fatalf("total rewrapped rows = %d, want 10", totalRewrapped)
+	}
+
+	for i := 0; i < 10; i++ {
+		scopeID := fmt.Sprintf("concurrent-%d", i)
+		key, err := store.GetKey(ctx, "secret", scopeID, 1)
+		if err != nil {
+			t.Fatalf("GetKey %s: %v", scopeID, err)
+		}
+		if key.SystemKeyID != "new" {
+			t.Fatalf("%s system key = %q, want %q", scopeID, key.SystemKeyID, "new")
+		}
+	}
+}
+
+func TestRewrapSystemKeys_HistoricalCiphertextsRemainDecryptable(t *testing.T) {
+	db := setupPostgres(t)
+	store := postgres.NewStore(postgres.Config{}, db)
+	ctx := context.Background()
+	c := aesgcm.New()
+
+	oldKey := makeSystemKey(50)
+	newKey := makeSystemKey(150)
+	oldOnly := systemkey.NewKeyring(map[string][]byte{
+		"old": oldKey,
+	}, "old")
+	bothKeys := systemkey.NewKeyring(map[string][]byte{
+		"old": oldKey,
+		"new": newKey,
+	}, "new")
+	newOnly := systemkey.NewKeyring(map[string][]byte{
+		"new": newKey,
+	}, "new")
+
+	mustStoreEncryptedKey(t, store, ctx, c, oldKey, "old", "secret", "history", 1, []byte("11111111111111111111111111111111"))
+	oldEncryptor := envelope.NewEncryptor(oldOnly, store, c)
+
+	ciphertextV1, versionV1, err := oldEncryptor.Encrypt(ctx, "secret", "history", "alpha")
+	if err != nil {
+		t.Fatalf("Encrypt v1: %v", err)
+	}
+	if versionV1 != 1 {
+		t.Fatalf("versionV1 = %d, want 1", versionV1)
+	}
+
+	mustStoreEncryptedKey(t, store, ctx, c, oldKey, "old", "secret", "history", 2, []byte("22222222222222222222222222222222"))
+	if err := store.RevokeKeys(ctx, "secret", "history"); err != nil {
+		t.Fatalf("RevokeKeys: %v", err)
+	}
+
+	ciphertextV2, versionV2, err := oldEncryptor.Encrypt(ctx, "secret", "history", "beta")
+	if err != nil {
+		t.Fatalf("Encrypt v2: %v", err)
+	}
+	if versionV2 != 2 {
+		t.Fatalf("versionV2 = %d, want 2", versionV2)
+	}
+
+	result, err := store.RewrapSystemKeys(ctx, bothKeys, c, postgres.RewrapSystemKeysOptions{
+		FromSystemKeyID: "old",
+		ToSystemKeyID:   "new",
+	})
+	if err != nil {
+		t.Fatalf("RewrapSystemKeys: %v", err)
+	}
+	if result.RewrappedRows != 2 {
+		t.Fatalf("RewrappedRows = %d, want 2", result.RewrappedRows)
+	}
+
+	newEncryptor := envelope.NewEncryptor(newOnly, store, c)
+
+	plaintextV1, err := newEncryptor.Decrypt(ctx, "secret", "history", ciphertextV1, versionV1)
+	if err != nil {
+		t.Fatalf("Decrypt v1 with new key only: %v", err)
+	}
+	if plaintextV1 != "alpha" {
+		t.Fatalf("plaintextV1 = %q, want %q", plaintextV1, "alpha")
+	}
+
+	plaintextV2, err := newEncryptor.Decrypt(ctx, "secret", "history", ciphertextV2, versionV2)
+	if err != nil {
+		t.Fatalf("Decrypt v2 with new key only: %v", err)
+	}
+	if plaintextV2 != "beta" {
+		t.Fatalf("plaintextV2 = %q, want %q", plaintextV2, "beta")
 	}
 }
