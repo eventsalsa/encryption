@@ -124,7 +124,7 @@ func (s *Store) rewrapSystemKeyBatch(ctx context.Context, sourceKey, targetKey [
 	if err != nil {
 		return RewrapSystemKeysResult{}, fmt.Errorf("postgres rewrap: begin batch tx: %w", err)
 	}
-	defer tx.Rollback() //nolint:errcheck
+	defer tx.Rollback() //nolint:errcheck // Best-effort cleanup; commit path handles the success case explicitly.
 
 	candidates, err := s.selectRowsForRewrap(ctx, tx, opts.FromSystemKeyID, opts.BatchSize)
 	if err != nil {
@@ -178,13 +178,13 @@ func (s *Store) selectRowsForRewrap(ctx context.Context, tx *sql.Tx, systemKeyID
 		WHERE system_key_id = $1
 		ORDER BY scope, scope_id, key_version
 		LIMIT $2
-		FOR UPDATE SKIP LOCKED`, s.fqtn())
+		FOR UPDATE SKIP LOCKED`, s.fqtn()) //#nosec G201 -- fqtn is derived from trusted postgres.Config schema/table settings, not user input.
 
 	rows, err := tx.QueryContext(ctx, query, systemKeyID, batchSize)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close() //nolint:errcheck
+	defer rows.Close() //nolint:errcheck // Best-effort cleanup after QueryContext; rows.Err handles iteration failures.
 
 	candidates := make([]rewrapCandidate, 0, batchSize)
 	for rows.Next() {
@@ -204,7 +204,7 @@ func (s *Store) selectRowsForRewrap(ctx context.Context, tx *sql.Tx, systemKeyID
 func (s *Store) updateRewrappedRow(ctx context.Context, tx *sql.Tx, candidate rewrapCandidate, encryptedDEK []byte, opts RewrapSystemKeysOptions) (int64, error) {
 	query := fmt.Sprintf(`UPDATE %s
 		SET encrypted_key = $1, system_key_id = $2
-		WHERE scope = $3 AND scope_id = $4 AND key_version = $5 AND system_key_id = $6`, s.fqtn())
+		WHERE scope = $3 AND scope_id = $4 AND key_version = $5 AND system_key_id = $6`, s.fqtn()) //#nosec G201 -- fqtn is derived from trusted postgres.Config schema/table settings, not user input.
 
 	result, err := tx.ExecContext(
 		ctx,

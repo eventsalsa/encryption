@@ -3,12 +3,15 @@
 ## Build & Test
 
 ```bash
+make check
 go build ./...
 go test -race ./...
 go test -race ./cipher/aesgcm/                 # single package
 go test -race -run TestRoundtrip ./envelope/    # single test
 go vet ./...
 ```
+
+> If a session changes any source file, it must end by running the full local validation suite. `make check` is the canonical entrypoint and must cover the checks mirrored by `.github/workflows/ci.yml` and the locally runnable parts of `.github/workflows/security.yml`: `gofmt -l .`, `go vet ./...`, `golangci-lint run --timeout=5m`, `go test -race -count=1 -coverprofile=... ./...`, `go build ./...`, `go test -race -count=1 -tags=integration ./...`, `gosec`, and `govulncheck`. Also call out the GitHub-only CodeQL analysis explicitly if it was not run locally.
 
 Go 1.24+. Zero external dependencies — only Go standard library (`crypto/*`, `database/sql`, `encoding/base64`). The PostgreSQL keystore adapter uses `database/sql`; consumers bring their own driver.
 
