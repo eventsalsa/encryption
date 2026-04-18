@@ -178,6 +178,46 @@ store := postgres.NewStoreWithTxExtractor(postgres.Config{}, db,
 
 Resolution order: custom extractor → `keystore.TxFromContext` → `*sql.DB` fallback.
 
+### System-Key Rewrap
+
+If you introduce a new system key and want to retire an old one, the PostgreSQL store exposes an explicit administrative API for re-encrypting stored DEKs in place:
+
+```go
+import (
+	"github.com/eventsalsa/encryption/cipher/aesgcm"
+	"github.com/eventsalsa/encryption/keystore/postgres"
+)
+
+c := aesgcm.New()
+
+result, err := store.RewrapSystemKeys(ctx, keyring, c, postgres.RewrapSystemKeysOptions{
+	FromSystemKeyID: "key-1",
+	ToSystemKeyID:   "key-2",
+	BatchSize:       500,
+})
+if err != nil {
+	return err
+}
+
+log.Printf("rewrapped=%d remaining=%d batches=%d", result.RewrappedRows, result.RemainingRows, result.Batches)
+```
+
+This operation:
+
+- re-encrypts the same stored DEK under a new system key
+- preserves the existing `(scope, scope_id, key_version)` row identity
+- covers historical revoked rows as well as active rows
+- does **not** rotate DEKs or re-encrypt application ciphertext
+
+Recommended sequence:
+
+1. Load both the old and new system keys into the keyring.
+2. Make the new system key active for new writes.
+3. Run `RewrapSystemKeys` from the old key ID to the new key ID until `RemainingRows` is zero.
+4. Verify the migration result, then retire the old system key.
+
+The library keeps this as a package-level API rather than a built-in standalone CLI so applications can supply their own database driver, key loading, logging, and deployment controls around the migration.
+
 ## Architecture
 
 ```
