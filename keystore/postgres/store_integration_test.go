@@ -5,7 +5,6 @@ package postgres_test
 import (
 	"bytes"
 	"context"
-	"database/sql"
 	"errors"
 	"fmt"
 	"sync"
@@ -19,14 +18,15 @@ import (
 	"github.com/eventsalsa/encryption/keystore/postgres"
 	"github.com/eventsalsa/encryption/keystore/postgres/migrations"
 	"github.com/eventsalsa/encryption/systemkey"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 
-	_ "github.com/lib/pq"
 	"github.com/testcontainers/testcontainers-go"
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
 	"github.com/testcontainers/testcontainers-go/wait"
 )
 
-func setupPostgres(t *testing.T) *sql.DB {
+func setupPostgres(t *testing.T) *pgxpool.Pool {
 	t.Helper()
 	ctx := context.Background()
 
@@ -54,14 +54,14 @@ func setupPostgres(t *testing.T) *sql.DB {
 		t.Fatalf("connection string: %v", err)
 	}
 
-	db, err := sql.Open("postgres", connStr)
+	db, err := pgxpool.New(ctx, connStr)
 	if err != nil {
 		t.Fatalf("open db: %v", err)
 	}
 	t.Cleanup(func() { db.Close() })
 
 	// Create schema and apply migration.
-	if _, err := db.ExecContext(ctx, "CREATE SCHEMA IF NOT EXISTS infrastructure"); err != nil {
+	if _, err := db.Exec(ctx, "CREATE SCHEMA IF NOT EXISTS infrastructure"); err != nil {
 		t.Fatalf("create schema: %v", err)
 	}
 
@@ -69,7 +69,7 @@ func setupPostgres(t *testing.T) *sql.DB {
 	if err != nil {
 		t.Fatalf("read migration: %v", err)
 	}
-	if _, err := db.ExecContext(ctx, string(migration)); err != nil {
+	if _, err := db.Exec(ctx, string(migration)); err != nil {
 		t.Fatalf("apply migration: %v", err)
 	}
 
@@ -348,17 +348,17 @@ func TestWithTx_Commit(t *testing.T) {
 	store := postgres.NewStore(postgres.Config{}, db)
 	ctx := context.Background()
 
-	tx, err := db.BeginTx(ctx, nil)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	txCtx := keystore.WithTx(ctx, tx)
 	if err := store.CreateKey(txCtx, "tx", "commit", 1, []byte("dek"), "sk"); err != nil {
-		tx.Rollback()
+		tx.Rollback(ctx)
 		t.Fatal(err)
 	}
-	if err := tx.Commit(); err != nil {
+	if err := tx.Commit(ctx); err != nil {
 		t.Fatal(err)
 	}
 
@@ -377,14 +377,14 @@ func TestWithTx_Rollback(t *testing.T) {
 	store := postgres.NewStore(postgres.Config{}, db)
 	ctx := context.Background()
 
-	tx, err := db.BeginTx(ctx, nil)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	txCtx := keystore.WithTx(ctx, tx)
 	_ = store.CreateKey(txCtx, "tx", "rollback", 1, []byte("dek"), "sk")
-	tx.Rollback()
+	tx.Rollback(ctx)
 
 	_, err = store.GetActiveKey(ctx, "tx", "rollback")
 	if !errors.Is(err, encryption.ErrKeyNotFound) {
@@ -400,7 +400,7 @@ func TestWithTx_MultipleOperationsAtomic(t *testing.T) {
 	// Create initial key outside tx.
 	_ = store.CreateKey(ctx, "tx", "atomic", 1, []byte("v1"), "sk")
 
-	tx, err := db.BeginTx(ctx, nil)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -408,14 +408,14 @@ func TestWithTx_MultipleOperationsAtomic(t *testing.T) {
 	txCtx := keystore.WithTx(ctx, tx)
 	// Create v2 and revoke within same tx.
 	if err := store.CreateKey(txCtx, "tx", "atomic", 2, []byte("v2"), "sk"); err != nil {
-		tx.Rollback()
+		tx.Rollback(ctx)
 		t.Fatal(err)
 	}
 	if err := store.RevokeKeys(txCtx, "tx", "atomic"); err != nil {
-		tx.Rollback()
+		tx.Rollback(ctx)
 		t.Fatal(err)
 	}
-	tx.Rollback()
+	tx.Rollback(ctx)
 
 	// After rollback, only v1 should exist and be active.
 	active, err := store.GetActiveKey(ctx, "tx", "atomic")
@@ -438,13 +438,13 @@ func TestTxExtractor(t *testing.T) {
 	ctx := context.Background()
 
 	store := postgres.NewStoreWithTxExtractor(postgres.Config{}, db,
-		func(ctx context.Context) *sql.Tx {
-			tx, _ := ctx.Value(customTxKey{}).(*sql.Tx)
+		func(ctx context.Context) pgx.Tx {
+			tx, _ := ctx.Value(customTxKey{}).(pgx.Tx)
 			return tx
 		},
 	)
 
-	tx, err := db.BeginTx(ctx, nil)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -452,10 +452,10 @@ func TestTxExtractor(t *testing.T) {
 	// Use custom context key (not keystore.WithTx).
 	txCtx := context.WithValue(ctx, customTxKey{}, tx)
 	if err := store.CreateKey(txCtx, "ext", "custom", 1, []byte("dek"), "sk"); err != nil {
-		tx.Rollback()
+		tx.Rollback(ctx)
 		t.Fatal(err)
 	}
-	if err := tx.Commit(); err != nil {
+	if err := tx.Commit(ctx); err != nil {
 		t.Fatal(err)
 	}
 
@@ -477,7 +477,7 @@ func TestCustomSchemaAndTable(t *testing.T) {
 	ctx := context.Background()
 
 	// Create custom schema and table.
-	if _, err := db.ExecContext(ctx, "CREATE SCHEMA IF NOT EXISTS custom_schema"); err != nil {
+	if _, err := db.Exec(ctx, "CREATE SCHEMA IF NOT EXISTS custom_schema"); err != nil {
 		t.Fatal(err)
 	}
 	migration, _ := migrations.FS.ReadFile("001_encryption_keys.sql")
@@ -488,7 +488,7 @@ func TestCustomSchemaAndTable(t *testing.T) {
 		"created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), revoked_at TIMESTAMPTZ, " +
 		"PRIMARY KEY (scope, scope_id, key_version))"
 	_ = migration // use our custom DDL
-	if _, err := db.ExecContext(ctx, customMigration); err != nil {
+	if _, err := db.Exec(ctx, customMigration); err != nil {
 		t.Fatal(err)
 	}
 
@@ -575,7 +575,7 @@ func TestMigrationIdempotent(t *testing.T) {
 	migration, _ := migrations.FS.ReadFile("001_encryption_keys.sql")
 
 	// Apply migration a second time — should not fail due to IF NOT EXISTS.
-	if _, err := db.ExecContext(ctx, string(migration)); err != nil {
+	if _, err := db.Exec(ctx, string(migration)); err != nil {
 		t.Fatalf("re-applying migration should be idempotent: %v", err)
 	}
 }

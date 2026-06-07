@@ -2,24 +2,26 @@ package postgres
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 
 	encryption "github.com/eventsalsa/encryption/encerr"
 	"github.com/eventsalsa/encryption/keystore"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// queryable is satisfied by both *sql.DB and *sql.Tx.
+// queryable is satisfied by both *pgxpool.Pool and pgx.Tx.
 type queryable interface {
-	QueryContext(ctx context.Context, query string, args ...interface{}) (*sql.Rows, error)
-	QueryRowContext(ctx context.Context, query string, args ...interface{}) *sql.Row
-	ExecContext(ctx context.Context, query string, args ...interface{}) (sql.Result, error)
+	Query(ctx context.Context, query string, args ...interface{}) (pgx.Rows, error)
+	QueryRow(ctx context.Context, query string, args ...interface{}) pgx.Row
+	Exec(ctx context.Context, query string, args ...interface{}) (pgconn.CommandTag, error)
 }
 
-// TxExtractor extracts a *sql.Tx from context. Return nil if no tx is active.
+// TxExtractor extracts a pgx.Tx from context. Return nil if no tx is active.
 // Used by consumers with their own transaction-propagation mechanism
 // (e.g., Unit of Work, CQRS middleware).
-type TxExtractor func(ctx context.Context) *sql.Tx
+type TxExtractor func(ctx context.Context) pgx.Tx
 
 // Config holds the schema and table names for the PostgreSQL keystore.
 type Config struct {
@@ -45,7 +47,7 @@ func DefaultConfig() Config {
 // Store implements keystore.KeyStore backed by PostgreSQL.
 type Store struct {
 	cfg     Config
-	db      *sql.DB
+	db      *pgxpool.Pool
 	extract TxExtractor
 }
 
@@ -62,18 +64,18 @@ func ApplyDefaults(cfg Config) Config {
 
 // NewStore creates a new PostgreSQL-backed keystore with the given config.
 // Empty Schema defaults to "infrastructure"; empty Table defaults to "encryption_keys".
-// Reads use the connection pool. Writes auto-commit via *sql.DB.
+// Reads use the connection pool. Writes auto-commit via *pgxpool.Pool.
 // Use keystore.WithTx(ctx, tx) to opt into transaction participation.
-func NewStore(cfg Config, db *sql.DB) *Store {
+func NewStore(cfg Config, db *pgxpool.Pool) *Store {
 	return &Store{cfg: ApplyDefaults(cfg), db: db}
 }
 
 // NewStoreWithTxExtractor creates a store with a custom tx extractor.
-// Resolution order: custom extractor → library's keystore.WithTx → *sql.DB.
+// Resolution order: custom extractor → library's keystore.WithTx → *pgxpool.Pool.
 //
-// Use this for Unit of Work patterns where *sql.Tx lives under your
+// Use this for Unit of Work patterns where pgx.Tx lives under your
 // own context key rather than the library's keystore.WithTx key.
-func NewStoreWithTxExtractor(cfg Config, db *sql.DB, extract TxExtractor) *Store {
+func NewStoreWithTxExtractor(cfg Config, db *pgxpool.Pool, extract TxExtractor) *Store {
 	return &Store{cfg: ApplyDefaults(cfg), db: db, extract: extract}
 }
 
@@ -104,11 +106,11 @@ func (s *Store) GetActiveKey(ctx context.Context, scope, scopeID string) (*keyst
 		LIMIT 1`, s.fqtn())
 
 	var k keystore.EncryptedKey
-	err := s.conn(ctx).QueryRowContext(ctx, query, scope, scopeID).Scan(
+	err := s.conn(ctx).QueryRow(ctx, query, scope, scopeID).Scan(
 		&k.Scope, &k.ScopeID, &k.KeyVersion, &k.EncryptedDEK,
 		&k.SystemKeyID, &k.CreatedAt, &k.RevokedAt,
 	)
-	if err == sql.ErrNoRows {
+	if err == pgx.ErrNoRows {
 		return nil, encryption.ErrKeyNotFound
 	}
 	if err != nil {
@@ -124,11 +126,11 @@ func (s *Store) GetKey(ctx context.Context, scope, scopeID string, version int) 
 		WHERE scope = $1 AND scope_id = $2 AND key_version = $3`, s.fqtn())
 
 	var k keystore.EncryptedKey
-	err := s.conn(ctx).QueryRowContext(ctx, query, scope, scopeID, version).Scan(
+	err := s.conn(ctx).QueryRow(ctx, query, scope, scopeID, version).Scan(
 		&k.Scope, &k.ScopeID, &k.KeyVersion, &k.EncryptedDEK,
 		&k.SystemKeyID, &k.CreatedAt, &k.RevokedAt,
 	)
-	if err == sql.ErrNoRows {
+	if err == pgx.ErrNoRows {
 		return nil, encryption.ErrKeyNotFound
 	}
 	if err != nil {
@@ -142,7 +144,7 @@ func (s *Store) CreateKey(ctx context.Context, scope, scopeID string, version in
 	query := fmt.Sprintf(`INSERT INTO %s (scope, scope_id, key_version, encrypted_key, system_key_id)
 		VALUES ($1, $2, $3, $4, $5)`, s.fqtn())
 
-	_, err := s.conn(ctx).ExecContext(ctx, query, scope, scopeID, version, encryptedDEK, systemKeyID)
+	_, err := s.conn(ctx).Exec(ctx, query, scope, scopeID, version, encryptedDEK, systemKeyID)
 	return err
 }
 
@@ -158,7 +160,7 @@ func (s *Store) RevokeKeys(ctx context.Context, scope, scopeID string) error {
 			WHERE scope = $1 AND scope_id = $2
 		)`, fqtn, fqtn)
 
-	_, err := s.conn(ctx).ExecContext(ctx, query, scope, scopeID)
+	_, err := s.conn(ctx).Exec(ctx, query, scope, scopeID)
 	return err
 }
 
@@ -167,6 +169,6 @@ func (s *Store) DestroyKeys(ctx context.Context, scope, scopeID string) error {
 	query := fmt.Sprintf(`DELETE FROM %s
 		WHERE scope = $1 AND scope_id = $2`, s.fqtn())
 
-	_, err := s.conn(ctx).ExecContext(ctx, query, scope, scopeID)
+	_, err := s.conn(ctx).Exec(ctx, query, scope, scopeID)
 	return err
 }
