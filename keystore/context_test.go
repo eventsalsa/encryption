@@ -2,10 +2,10 @@ package keystore_test
 
 import (
 	"context"
-	"database/sql"
 	"testing"
 
 	"github.com/eventsalsa/encryption/keystore"
+	"github.com/jackc/pgx/v5"
 )
 
 func TestWithTxAndTxFromContext(t *testing.T) {
@@ -15,14 +15,14 @@ func TestWithTxAndTxFromContext(t *testing.T) {
 		t.Fatalf("expected nil from bare context, got %v", got)
 	}
 
-	// We can't create a real *sql.Tx without a database, but we can verify
-	// the context roundtrip by embedding a nil *sql.Tx and checking the type
-	// assertion path. For a real roundtrip, integration tests cover this.
-	var fakeTx *sql.Tx
+	// We can verify the context roundtrip by embedding a nil pgx.Tx
+	// and checking the type assertion path. For a real roundtrip,
+	// integration tests cover this.
+	var fakeTx pgx.Tx
 	ctx = keystore.WithTx(ctx, fakeTx)
 	got := keystore.TxFromContext(ctx)
 	if got != fakeTx {
-		t.Fatalf("expected roundtrip to return same *sql.Tx, got %v", got)
+		t.Fatalf("expected roundtrip to return same pgx.Tx, got %v", got)
 	}
 }
 

@@ -83,19 +83,19 @@ package main
 
 import (
 	"context"
-	"database/sql"
 	"log"
 
 	"github.com/eventsalsa/encryption"
 	_ "github.com/eventsalsa/encryption/cipher/aesgcm"
 	"github.com/eventsalsa/encryption/keystore/postgres"
 	"github.com/eventsalsa/encryption/systemkey"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 func main() {
 	ctx := context.Background()
 
-	db, err := sql.Open("postgres", "postgres://localhost/myapp?sslmode=disable")
+	db, err := pgxpool.New(ctx, "postgres://localhost/myapp?sslmode=disable")
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -131,20 +131,20 @@ func main() {
 }
 ```
 
-By default, all operations go through the `*sql.DB` connection pool — no transaction required for simple use cases.
+By default, all operations go through the `*pgxpool.Pool` connection pool — no transaction required for simple use cases.
 
 ### Transaction Participation
 
-In event-sourced systems you typically want key creation and event persistence to happen atomically. Use `keystore.WithTx` to attach an existing `*sql.Tx` to the context — all key store operations within that context will use the transaction instead of the pool:
+In event-sourced systems you typically want key creation and event persistence to happen atomically. Use `keystore.WithTx` to attach an existing `pgx.Tx` to the context — all key store operations within that context will use the transaction instead of the pool:
 
 ```go
 import "github.com/eventsalsa/encryption/keystore"
 
-tx, err := db.BeginTx(ctx, nil)
+tx, err := db.Begin(ctx)
 if err != nil {
 	return err
 }
-defer tx.Rollback()
+defer tx.Rollback(ctx)
 
 ctx = keystore.WithTx(ctx, tx)
 
@@ -161,7 +161,7 @@ if err != nil {
 
 // Persist the aggregate event in the same transaction...
 
-return tx.Commit()
+return tx.Commit(ctx)
 ```
 
 ### Custom Transaction Extractor
@@ -170,13 +170,13 @@ If your application already propagates transactions through its own context key 
 
 ```go
 store := postgres.NewStoreWithTxExtractor(postgres.Config{}, db,
-	func(ctx context.Context) *sql.Tx {
+	func(ctx context.Context) pgx.Tx {
 		return myuow.TxFromContext(ctx)
 	},
 )
 ```
 
-Resolution order: custom extractor → `keystore.TxFromContext` → `*sql.DB` fallback.
+Resolution order: custom extractor → `keystore.TxFromContext` → `*pgxpool.Pool` fallback.
 
 ### System-Key Rewrap
 
