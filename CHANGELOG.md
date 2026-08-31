@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.0.4 - 2026-06-07
+
+### Added
+
+- Migrated database keystore and transaction utilities to native `pgx/v5` (#7).
+
+### Changed
+
+- Migrated repository agent instructions and workflow configuration (#6).
+
 ## v0.0.3 - 2026-04-18
 
 ### Added
@@ -27,3 +37,9 @@
 ### Fixed
 
 - Pinned the GitHub Actions gosec step to `securego/gosec@v2.25.0`, fixing workflow resolution failures caused by the missing `v2` ref.
+
+## v0.0.1 - 2026-04-16
+
+### Added
+
+- Initial release of envelope encryption library with AES-256-GCM cipher, system keyring, and PostgreSQL keystore.
