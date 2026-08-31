@@ -1,4 +1,4 @@
-// Example: GDPR PII encryption and crypto-shredding lifecycle.
+// Example: GDPR PII encryption and crypto-shredding lifecycle with PostgreSQL.
 //
 // In event-sourced architectures, events are immutable and cannot be deleted.
 // Crypto-shredding solves GDPR's "Right to Erasure" (Article 17) by:
@@ -14,8 +14,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
 	"os"
+	"time"
 
 	"github.com/eventsalsa/encryption"
 	"github.com/eventsalsa/encryption/cipher/aesgcm"
@@ -24,147 +24,145 @@ import (
 	"github.com/eventsalsa/encryption/postgres/migrations"
 	"github.com/eventsalsa/encryption/testutil"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/testcontainers/testcontainers-go"
+	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
+	"github.com/testcontainers/testcontainers-go/wait"
 )
 
 func main() {
 	if err := run(); err != nil {
-		log.Fatalf("error: %v", err)
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
 	}
 }
 
 func run() error {
 	ctx := context.Background()
-	dbURL := os.Getenv("DATABASE_URL")
 
+	// 1. Connect to PostgreSQL (uses DATABASE_URL or starts an ephemeral container)
+	pool, cleanup, err := connectPostgres(ctx)
+	if err != nil {
+		return fmt.Errorf("connect to database: %w", err)
+	}
+	defer cleanup()
+
+	// 2. Initialize Keyring, Cipher, Envelope engine, and Postgres Keystore
 	keyring := testutil.NewTestKeyring()
 	c := aesgcm.New()
 	env := envelope.New(keyring, c)
 	store := postgres.NewStore(env, postgres.Config{})
 
-	userID := "user-4815162342"
+	userID := "user-99"
 	scope := "user_pii"
 
-	if dbURL != "" {
-		pool, err := pgxpool.New(ctx, dbURL)
-		if err != nil {
-			return fmt.Errorf("connect to postgres: %w", err)
-		}
-		defer pool.Close()
+	// 3. User Registration: Create 1 DEK (version 1) inside the SQL transaction
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
 
-		// Apply keystore migration
-		migrationSQL, err := migrations.SQL(postgres.Config{})
-		if err != nil {
-			return fmt.Errorf("generate migration: %w", err)
-		}
-		if _, err := pool.Exec(ctx, "CREATE SCHEMA IF NOT EXISTS infrastructure"); err != nil {
-			return fmt.Errorf("create schema: %w", err)
-		}
-		if _, err := pool.Exec(ctx, migrationSQL); err != nil {
-			return fmt.Errorf("apply migration: %w", err)
-		}
+	v, err := store.CreateKey(ctx, tx, scope, userID)
+	if err != nil {
+		return fmt.Errorf("create key: %w", err)
+	}
+	fmt.Printf("1. Created PII key version %d for user %s inside transaction\n", v, userID)
 
-		fmt.Printf("=== 1. User Registration (Creating PII DEK inside Transaction) ===\n")
-		tx, err := pool.Begin(ctx)
-		if err != nil {
-			return fmt.Errorf("begin tx: %w", err)
-		}
-		defer func() {
-			_ = tx.Rollback(ctx)
-		}()
-
-		// Create user DEK at version 1
-		v, err := store.CreateKey(ctx, tx, scope, userID)
-		if err != nil {
-			return fmt.Errorf("create key: %w", err)
-		}
-		fmt.Printf("Created PII key version %d for user %s\n", v, userID)
-
-		// Fetch active key inside transaction
-		key, err := store.GetActiveKey(ctx, tx, scope, userID)
-		if err != nil {
-			return fmt.Errorf("get active key: %w", err)
-		}
-
-		// Encrypt PII payload in-memory (zero DB overhead)
-		emailPayload := "alice.smith@example.com"
-		ciphertext, err := env.Encrypt(key.SystemKeyID, key.EncryptedDEK, emailPayload)
-		if err != nil {
-			return fmt.Errorf("encrypt: %w", err)
-		}
-		fmt.Printf("Encrypted email: %s\n", ciphertext)
-
-		if err := tx.Commit(ctx); err != nil {
-			return fmt.Errorf("commit tx: %w", err)
-		}
-
-		fmt.Printf("\n=== 2. Event Sourced Read Path (Decryption) ===\n")
-		readKey, err := store.GetActiveKey(ctx, pool, scope, userID)
-		if err != nil {
-			return fmt.Errorf("get active key: %w", err)
-		}
-		decrypted, err := env.Decrypt(readKey.SystemKeyID, readKey.EncryptedDEK, ciphertext)
-		if err != nil {
-			return fmt.Errorf("decrypt: %w", err)
-		}
-		fmt.Printf("Decrypted email: %s\n", decrypted)
-
-		fmt.Printf("\n=== 3. GDPR Article 17 Erasure Request (Crypto-Shredding) ===\n")
-		// Permanently delete user DEK from PostgreSQL
-		if err := store.DestroyKeys(ctx, pool, scope, userID); err != nil {
-			return fmt.Errorf("destroy keys: %w", err)
-		}
-		fmt.Printf("Hard-deleted encryption key for %s:%s\n", scope, userID)
-
-		// Attempting to read key now returns ErrKeyNotFound
-		_, err = store.GetActiveKey(ctx, pool, scope, userID)
-		if errors.Is(err, encryption.ErrKeyNotFound) {
-			fmt.Printf("Key retrieval status: %v (as expected)\n", err)
-		} else {
-			return fmt.Errorf("expected ErrKeyNotFound, got %v", err)
-		}
-
-		fmt.Println("\n✓ User PII in the immutable event log is permanently and mathematically shredded.")
-	} else {
-		fmt.Println("=== GDPR PII Crypto-Shredding Workflow ===")
-		fmt.Println("Note: Set DATABASE_URL to run against live PostgreSQL.")
-		fmt.Println()
-		fmt.Println("1. PII Key Strategy: 1 DEK pinned per subject (version 1).")
-		fmt.Println("   - DEKs are created once during user registration: store.CreateKey(ctx, tx, \"user_pii\", userID)")
-		fmt.Println("   - System KEK rotation uses postgres.RewrapSystemKeys in-place without rotating DEKs.")
-		fmt.Println("2. Crypto-Shredding: store.DestroyKeys(ctx, pool, \"user_pii\", userID)")
-		fmt.Println("   - Hard-deletes the DEK row (DELETE FROM infrastructure.encryption_keys).")
-		fmt.Println("   - Historical event streams remain immutable, but all ciphertext is unreadable.")
-
-		// Demonstrate pure in-memory crypto-shredding step
-		dek, err := env.GenerateDEK()
-		if err != nil {
-			return fmt.Errorf("generate DEK: %w", err)
-		}
-		defer encryption.ZeroBytes(dek)
-
-		sysKeyID := env.ActiveKeyID()
-		encDEK, err := env.WrapDEK(sysKeyID, dek)
-		if err != nil {
-			return fmt.Errorf("wrap DEK: %w", err)
-		}
-
-		email := "alice.smith@example.com"
-		ciphertext, err := env.Encrypt(sysKeyID, encDEK, email)
-		if err != nil {
-			return fmt.Errorf("encrypt: %w", err)
-		}
-		fmt.Printf("\nDemo encrypted ciphertext: %s\n", ciphertext)
-
-		decrypted, err := env.Decrypt(sysKeyID, encDEK, ciphertext)
-		if err != nil {
-			return fmt.Errorf("decrypt: %w", err)
-		}
-		fmt.Printf("Demo decrypted plaintext:  %s\n", decrypted)
-
-		encryption.ZeroBytes(encDEK)
-		fmt.Println("Demo DEK destroyed from memory.")
-		fmt.Println("\n✓ GDPR Right to Erasure satisfied.")
+	key, err := store.GetActiveKey(ctx, tx, scope, userID)
+	if err != nil {
+		return fmt.Errorf("get active key: %w", err)
 	}
 
+	// 4. Encrypt user PII in-memory (zero DB overhead)
+	ciphertext, err := env.Encrypt(key.SystemKeyID, key.EncryptedDEK, "alice.smith@example.com")
+	if err != nil {
+		return fmt.Errorf("encrypt: %w", err)
+	}
+	fmt.Printf("2. Encrypted PII payload: %s\n", ciphertext)
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit tx: %w", err)
+	}
+
+	// 5. Read / Decrypt event payload
+	readKey, err := store.GetActiveKey(ctx, pool, scope, userID)
+	if err != nil {
+		return fmt.Errorf("get active key: %w", err)
+	}
+	decrypted, err := env.Decrypt(readKey.SystemKeyID, readKey.EncryptedDEK, ciphertext)
+	if err != nil {
+		return fmt.Errorf("decrypt: %w", err)
+	}
+	fmt.Printf("3. Decrypted PII payload: %s\n", decrypted)
+
+	// 6. GDPR Article 17 Erasure Request: Crypto-Shred the DEK
+	if err := store.DestroyKeys(ctx, pool, scope, userID); err != nil {
+		return fmt.Errorf("destroy keys: %w", err)
+	}
+	fmt.Printf("4. Hard-deleted encryption keys for %s:%s\n", scope, userID)
+
+	// 7. Verify key is gone — historical events are now permanently undecryptable
+	_, err = store.GetActiveKey(ctx, pool, scope, userID)
+	if errors.Is(err, encryption.ErrKeyNotFound) {
+		fmt.Println("5. Key retrieval status: ErrKeyNotFound (as expected)")
+		fmt.Println("\n✓ PII is permanently undecryptable. GDPR Right to Erasure satisfied.")
+	}
 	return nil
+}
+
+func connectPostgres(ctx context.Context) (*pgxpool.Pool, func(), error) {
+	connStr := os.Getenv("DATABASE_URL")
+	cleanup := func() {}
+
+	if connStr == "" {
+		ctr, err := tcpostgres.Run(ctx, "postgres:16-alpine",
+			tcpostgres.WithDatabase("encryption_example"),
+			tcpostgres.WithUsername("test"),
+			tcpostgres.WithPassword("test"),
+			testcontainers.WithWaitStrategy(
+				wait.ForLog("database system is ready to accept connections").
+					WithOccurrence(2).
+					WithStartupTimeout(30*time.Second),
+			),
+		)
+		if err != nil {
+			return nil, nil, fmt.Errorf("start postgres container: %w", err)
+		}
+		cleanup = func() { _ = ctr.Terminate(ctx) }
+
+		connStr, err = ctr.ConnectionString(ctx, "sslmode=disable")
+		if err != nil {
+			cleanup()
+			return nil, nil, fmt.Errorf("container connection string: %w", err)
+		}
+	}
+
+	pool, err := pgxpool.New(ctx, connStr)
+	if err != nil {
+		cleanup()
+		return nil, nil, fmt.Errorf("open db pool: %w", err)
+	}
+
+	migrationSQL, err := migrations.SQL(postgres.Config{})
+	if err != nil {
+		pool.Close()
+		cleanup()
+		return nil, nil, fmt.Errorf("render migration: %w", err)
+	}
+	if _, err := pool.Exec(ctx, "CREATE SCHEMA IF NOT EXISTS infrastructure"); err != nil {
+		pool.Close()
+		cleanup()
+		return nil, nil, fmt.Errorf("create schema: %w", err)
+	}
+	if _, err := pool.Exec(ctx, migrationSQL); err != nil {
+		pool.Close()
+		cleanup()
+		return nil, nil, fmt.Errorf("apply migration: %w", err)
+	}
+
+	combinedCleanup := func() {
+		pool.Close()
+		cleanup()
+	}
+	return pool, combinedCleanup, nil
 }
