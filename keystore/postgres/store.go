@@ -8,20 +8,16 @@ import (
 	"github.com/eventsalsa/encryption/keystore"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
-	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// queryable is satisfied by both *pgxpool.Pool and pgx.Tx.
-type queryable interface {
-	Query(ctx context.Context, query string, args ...interface{}) (pgx.Rows, error)
-	QueryRow(ctx context.Context, query string, args ...interface{}) pgx.Row
-	Exec(ctx context.Context, query string, args ...interface{}) (pgconn.CommandTag, error)
+// PgxConn represents any pgx database executor (*pgxpool.Pool, pgx.Tx, *pgx.Conn).
+type PgxConn interface {
+	Query(ctx context.Context, query string, args ...any) (pgx.Rows, error)
+	QueryRow(ctx context.Context, query string, args ...any) pgx.Row
+	Exec(ctx context.Context, query string, args ...any) (pgconn.CommandTag, error)
 }
 
-// TxExtractor extracts a pgx.Tx from context. Return nil if no tx is active.
-// Used by consumers with their own transaction-propagation mechanism
-// (e.g., Unit of Work, CQRS middleware).
-type TxExtractor func(ctx context.Context) pgx.Tx
+type pgxConn = PgxConn
 
 // Config holds the schema and table names for the PostgreSQL keystore.
 type Config struct {
@@ -44,11 +40,10 @@ func DefaultConfig() Config {
 	}
 }
 
-// Store implements keystore.KeyStore backed by PostgreSQL.
+// Store implements keystore persistence backed by PostgreSQL using pgx.
+// It is a stateless configuration struct; all operations require an explicit pgx connection.
 type Store struct {
-	cfg     Config
-	db      *pgxpool.Pool
-	extract TxExtractor
+	cfg Config
 }
 
 // ApplyDefaults fills in the default schema and table names when omitted.
@@ -62,34 +57,9 @@ func ApplyDefaults(cfg Config) Config {
 	return cfg
 }
 
-// NewStore creates a new PostgreSQL-backed keystore with the given config.
-// Empty Schema defaults to "infrastructure"; empty Table defaults to "encryption_keys".
-// Reads use the connection pool. Writes auto-commit via *pgxpool.Pool.
-// Use keystore.WithTx(ctx, tx) to opt into transaction participation.
-func NewStore(cfg Config, db *pgxpool.Pool) *Store {
-	return &Store{cfg: ApplyDefaults(cfg), db: db}
-}
-
-// NewStoreWithTxExtractor creates a store with a custom tx extractor.
-// Resolution order: custom extractor → library's keystore.WithTx → *pgxpool.Pool.
-//
-// Use this for Unit of Work patterns where pgx.Tx lives under your
-// own context key rather than the library's keystore.WithTx key.
-func NewStoreWithTxExtractor(cfg Config, db *pgxpool.Pool, extract TxExtractor) *Store {
-	return &Store{cfg: ApplyDefaults(cfg), db: db, extract: extract}
-}
-
-// conn resolves the active database handle for this context.
-func (s *Store) conn(ctx context.Context) queryable {
-	if s.extract != nil {
-		if tx := s.extract(ctx); tx != nil {
-			return tx
-		}
-	}
-	if tx := keystore.TxFromContext(ctx); tx != nil {
-		return tx
-	}
-	return s.db
+// NewStore creates a new stateless PostgreSQL keystore with the given config.
+func NewStore(cfg Config) *Store {
+	return &Store{cfg: ApplyDefaults(cfg)}
 }
 
 // fqtn returns the fully qualified table name (schema.table).
@@ -97,8 +67,8 @@ func (s *Store) fqtn() string {
 	return fmt.Sprintf("%s.%s", s.cfg.Schema, s.cfg.Table)
 }
 
-// GetActiveKey returns the highest-version non-revoked key for the given scope.
-func (s *Store) GetActiveKey(ctx context.Context, scope, scopeID string) (*keystore.EncryptedKey, error) {
+// GetActiveKey returns the highest-version non-revoked key for the given scope using the provided connection.
+func (s *Store) GetActiveKey(ctx context.Context, conn pgxConn, scope, scopeID string) (*keystore.EncryptedKey, error) {
 	query := fmt.Sprintf(`SELECT scope, scope_id, key_version, encrypted_key, system_key_id, created_at, revoked_at
 		FROM %s
 		WHERE scope = $1 AND scope_id = $2 AND revoked_at IS NULL
@@ -106,7 +76,7 @@ func (s *Store) GetActiveKey(ctx context.Context, scope, scopeID string) (*keyst
 		LIMIT 1`, s.fqtn())
 
 	var k keystore.EncryptedKey
-	err := s.conn(ctx).QueryRow(ctx, query, scope, scopeID).Scan(
+	err := conn.QueryRow(ctx, query, scope, scopeID).Scan(
 		&k.Scope, &k.ScopeID, &k.KeyVersion, &k.EncryptedDEK,
 		&k.SystemKeyID, &k.CreatedAt, &k.RevokedAt,
 	)
@@ -119,14 +89,14 @@ func (s *Store) GetActiveKey(ctx context.Context, scope, scopeID string) (*keyst
 	return &k, nil
 }
 
-// GetKey returns a specific key version for the given scope.
-func (s *Store) GetKey(ctx context.Context, scope, scopeID string, version int) (*keystore.EncryptedKey, error) {
+// GetKey returns a specific key version for the given scope using the provided connection.
+func (s *Store) GetKey(ctx context.Context, conn pgxConn, scope, scopeID string, version int) (*keystore.EncryptedKey, error) {
 	query := fmt.Sprintf(`SELECT scope, scope_id, key_version, encrypted_key, system_key_id, created_at, revoked_at
 		FROM %s
 		WHERE scope = $1 AND scope_id = $2 AND key_version = $3`, s.fqtn())
 
 	var k keystore.EncryptedKey
-	err := s.conn(ctx).QueryRow(ctx, query, scope, scopeID, version).Scan(
+	err := conn.QueryRow(ctx, query, scope, scopeID, version).Scan(
 		&k.Scope, &k.ScopeID, &k.KeyVersion, &k.EncryptedDEK,
 		&k.SystemKeyID, &k.CreatedAt, &k.RevokedAt,
 	)
@@ -139,19 +109,18 @@ func (s *Store) GetKey(ctx context.Context, scope, scopeID string, version int) 
 	return &k, nil
 }
 
-// CreateKey inserts a new encrypted DEK into the keystore.
-func (s *Store) CreateKey(ctx context.Context, scope, scopeID string, version int, encryptedDEK []byte, systemKeyID string) error {
+// CreateKey inserts a new encrypted DEK into the keystore using the provided connection.
+func (s *Store) CreateKey(ctx context.Context, conn pgxConn, scope, scopeID string, version int, encryptedDEK []byte, systemKeyID string) error {
 	query := fmt.Sprintf(`INSERT INTO %s (scope, scope_id, key_version, encrypted_key, system_key_id)
 		VALUES ($1, $2, $3, $4, $5)`, s.fqtn())
 
-	_, err := s.conn(ctx).Exec(ctx, query, scope, scopeID, version, encryptedDEK, systemKeyID)
+	_, err := conn.Exec(ctx, query, scope, scopeID, version, encryptedDEK, systemKeyID)
 	return err
 }
 
 // RevokeKeys marks all active keys for the given scope as revoked,
-// except the highest version (the current active key).
-// Use DestroyKeys to permanently remove all keys including the active one.
-func (s *Store) RevokeKeys(ctx context.Context, scope, scopeID string) error {
+// except the highest version (the current active key), using the provided connection.
+func (s *Store) RevokeKeys(ctx context.Context, conn pgxConn, scope, scopeID string) error {
 	fqtn := s.fqtn()
 	query := fmt.Sprintf(`UPDATE %s SET revoked_at = NOW()
 		WHERE scope = $1 AND scope_id = $2 AND revoked_at IS NULL
@@ -160,15 +129,15 @@ func (s *Store) RevokeKeys(ctx context.Context, scope, scopeID string) error {
 			WHERE scope = $1 AND scope_id = $2
 		)`, fqtn, fqtn)
 
-	_, err := s.conn(ctx).Exec(ctx, query, scope, scopeID)
+	_, err := conn.Exec(ctx, query, scope, scopeID)
 	return err
 }
 
-// DestroyKeys permanently deletes all keys for the given scope.
-func (s *Store) DestroyKeys(ctx context.Context, scope, scopeID string) error {
+// DestroyKeys permanently deletes all keys for the given scope using the provided connection.
+func (s *Store) DestroyKeys(ctx context.Context, conn pgxConn, scope, scopeID string) error {
 	query := fmt.Sprintf(`DELETE FROM %s
 		WHERE scope = $1 AND scope_id = $2`, s.fqtn())
 
-	_, err := s.conn(ctx).Exec(ctx, query, scope, scopeID)
+	_, err := conn.Exec(ctx, query, scope, scopeID)
 	return err
 }

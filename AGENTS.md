@@ -51,9 +51,7 @@ The validation suite requires Go 1.24+ and is designed with zero external runtim
 
 ## 3. Architecture & Core Layout
 
-This repository provides an envelope encryption library for event-sourced systems, handling two distinct categories of data:
-1. **PII** (Personal Identifiable Information): Encrypted using per-subject keys. PII keys do not rotate. Deleting a key (crypto-shredding) renders the associated event payloads permanently unreadable.
-2. **Secrets**: Versioned system keys that support rotation. Older versions are preserved to decrypt historic payloads.
+This repository provides an envelope encryption library for event-sourced systems.
 
 ### Package Structure
 
@@ -62,11 +60,10 @@ This repository provides an envelope encryption library for event-sourced system
 | [encerr/](encerr) | `encerr` | Sentinel errors and memory zeroing utilities to prevent import cycles. |
 | [cipher/](cipher) | `cipher` | Pluggable symmetric encryption interface and implementations (default: AES-256-GCM). |
 | [systemkey/](systemkey) | `systemkey` | KEK (Key Encrypting Key) management abstractions. |
-| [keystore/](keystore) | `keystore` | Persistent encrypted storage for DEKs (Data Encrypting Keys). |
+| [keystore/](keystore) | `keystore` | Persistent encrypted storage abstractions for DEKs (Data Encrypting Keys). |
+| [keystore/postgres/](keystore/postgres) | `postgres` | Stateless PostgreSQL repository implementing DEK persistence with explicit `pgxConn`. |
 | [keymanager/](keymanager) | `keymanager` | Core orchestration for key creation, rotation, and shredding. |
-| [envelope/](envelope) | `envelope` | Main envelope encryption engine orchestrating DEK retrieval and encryption. |
-| [pii/](pii) | `pii` | GDPR crypto-shredding value types and generic wrappers. |
-| [secret/](secret) | `secret` | Versioned secret value types and rotation handling. |
+| [envelope/](envelope) | `envelope` | Pure in-memory envelope encryption engine (DEK wrapping & data encrypt/decrypt). |
 | [hash/](hash) | `hash` | Deterministic hashing (HMAC-SHA256) for uniqueness assertions. |
 | [encryption.go](encryption.go) | `encryption` | Main library entrypoint and package constructors. |
 
@@ -75,10 +72,10 @@ This repository provides an envelope encryption library for event-sourced system
 ## 4. Key Coding Conventions
 
 - **Circular Dependencies**: Avoid circular imports. Shared error sentinels and byte zeroing utilities live in [encerr/](encerr). Internal packages must import `encerr` directly. The root `encryption` package re-exports these public symbols for consumers.
-- **Interfaces**: Code to interfaces (e.g., `Cipher`, `KeyStore`, `Keyring`). Concrete implementations reside in sub-packages (e.g., `cipher/aesgcm/`, `keystore/postgres/`).
+- **Interfaces**: Code to interfaces (e.g., `Cipher`, `KeyStore`, `Keyring`, `PgxConn`). Concrete implementations reside in sub-packages (e.g., `cipher/aesgcm/`, `keystore/postgres/`).
+- **Decoupled Crypto**: `envelope.Envelope` is a pure in-memory engine with zero storage or context dependencies.
+- **Stateless Storage**: `postgres.Store` is stateless configuration only; all operations accept `conn pgxConn` directly (`*pgxpool.Pool`, `pgx.Tx`, `*pgx.Conn`).
 - **Memory Hygiene**: Always scrub plaintext keys (DEKs) from memory when finished. Defer `encryption.ZeroBytes` or `encerr.ZeroBytes` immediately after instantiation.
-- **Transaction Propagation**: The PostgreSQL store resolves database handles dynamically. Use `keystore.WithTx(ctx, tx)` to participate in an active SQL transaction or fallback to standard DB handle management.
-- **Subject Generic Identifiers**: PII operations use type generics `[ID fmt.Stringer]` for safety without coupling identifiers to domain entities.
 - **Scope Namespacing**: Keys are grouped by namespaces using `(scope, scopeID)` tuples to partition encryption scopes.
 
 ---

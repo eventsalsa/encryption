@@ -1,74 +1,54 @@
-// Package envelope implements envelope encryption using a two-tier key
-// hierarchy: system keys (KEKs) protect data encryption keys (DEKs), and DEKs
+// Package envelope implements pure in-memory envelope encryption using a two-tier
+// key hierarchy: system keys (KEKs) protect data encryption keys (DEKs), and DEKs
 // protect application data.
 package envelope
 
 import (
-	"context"
+	"crypto/rand"
 	"encoding/base64"
 	"fmt"
+	"io"
 
 	"github.com/eventsalsa/encryption/cipher"
 	encryption "github.com/eventsalsa/encryption/encerr"
-	"github.com/eventsalsa/encryption/keystore"
 	"github.com/eventsalsa/encryption/systemkey"
 )
 
-// Encryptor performs envelope encrypt/decrypt using a keyring, key store, and cipher.
-type Encryptor struct {
+// Envelope performs in-memory envelope encrypt/decrypt and DEK wrapping/unwrapping.
+// It is safe for concurrent use and has zero storage or database dependencies.
+type Envelope struct {
 	keyring systemkey.Keyring
-	store   keystore.KeyStore
 	cipher  cipher.Cipher
 }
 
-// NewEncryptor returns an Encryptor wired to the given keyring, store, and cipher.
-func NewEncryptor(keyring systemkey.Keyring, store keystore.KeyStore, c cipher.Cipher) *Encryptor {
-	return &Encryptor{keyring: keyring, store: store, cipher: c}
+// New returns an Envelope wired to the given keyring and symmetric cipher.
+func New(keyring systemkey.Keyring, c cipher.Cipher) *Envelope {
+	return &Envelope{keyring: keyring, cipher: c}
 }
 
-// Encrypt encrypts plaintext for the given scope/scopeID and returns the
-// base64-encoded ciphertext along with the key version used.
-func (e *Encryptor) Encrypt(ctx context.Context, scope, scopeID, plaintext string) (ciphertext string, keyVersion int, err error) {
-	key, err := e.store.GetActiveKey(ctx, scope, scopeID)
+// Encrypt unwraps the encrypted DEK using the specified system key, then encrypts
+// the plaintext with the DEK and returns base64-encoded ciphertext.
+func (e *Envelope) Encrypt(systemKeyID string, encryptedDEK []byte, plaintext string) (string, error) {
+	dek, err := e.UnwrapDEK(systemKeyID, encryptedDEK)
 	if err != nil {
-		return "", 0, fmt.Errorf("envelope encrypt: get active key: %w", err)
-	}
-
-	sysKey, err := e.keyring.Key(key.SystemKeyID)
-	if err != nil {
-		return "", 0, fmt.Errorf("envelope encrypt: get system key: %w", err)
-	}
-
-	dek, err := e.cipher.Decrypt(sysKey, key.EncryptedDEK)
-	if err != nil {
-		return "", 0, fmt.Errorf("envelope encrypt: decrypt DEK: %w", err)
+		return "", fmt.Errorf("envelope encrypt: %w", err)
 	}
 	defer encryption.ZeroBytes(dek)
 
 	ct, err := e.cipher.Encrypt(dek, []byte(plaintext))
 	if err != nil {
-		return "", 0, fmt.Errorf("envelope encrypt: %w", err)
+		return "", fmt.Errorf("envelope encrypt: %w", err)
 	}
 
-	return base64.StdEncoding.EncodeToString(ct), key.KeyVersion, nil
+	return base64.StdEncoding.EncodeToString(ct), nil
 }
 
-// Decrypt decrypts base64-encoded ciphertext that was encrypted under the
-// specified key version for the given scope/scopeID.
-func (e *Encryptor) Decrypt(ctx context.Context, scope, scopeID, ciphertext string, keyVersion int) (string, error) {
-	key, err := e.store.GetKey(ctx, scope, scopeID, keyVersion)
+// Decrypt unwraps the encrypted DEK using the specified system key, then decrypts
+// the base64-encoded ciphertext using the DEK and returns the plaintext.
+func (e *Envelope) Decrypt(systemKeyID string, encryptedDEK []byte, ciphertext string) (string, error) {
+	dek, err := e.UnwrapDEK(systemKeyID, encryptedDEK)
 	if err != nil {
-		return "", fmt.Errorf("envelope decrypt: get key: %w", err)
-	}
-
-	sysKey, err := e.keyring.Key(key.SystemKeyID)
-	if err != nil {
-		return "", fmt.Errorf("envelope decrypt: get system key: %w", err)
-	}
-
-	dek, err := e.cipher.Decrypt(sysKey, key.EncryptedDEK)
-	if err != nil {
-		return "", fmt.Errorf("envelope decrypt: decrypt DEK: %w", err)
+		return "", fmt.Errorf("envelope decrypt: %w", err)
 	}
 	defer encryption.ZeroBytes(dek)
 
@@ -83,4 +63,53 @@ func (e *Encryptor) Decrypt(ctx context.Context, scope, scopeID, ciphertext stri
 	}
 
 	return string(pt), nil
+}
+
+// WrapDEK encrypts a raw plaintext DEK using the specified system key.
+func (e *Envelope) WrapDEK(systemKeyID string, dek []byte) ([]byte, error) {
+	sysKey, err := e.keyring.Key(systemKeyID)
+	if err != nil {
+		return nil, fmt.Errorf("envelope wrap DEK: get system key %q: %w", systemKeyID, err)
+	}
+
+	encDEK, err := e.cipher.Encrypt(sysKey, dek)
+	if err != nil {
+		return nil, fmt.Errorf("envelope wrap DEK: %w", err)
+	}
+
+	return encDEK, nil
+}
+
+// UnwrapDEK decrypts an encrypted DEK using the specified system key and returns
+// the raw plaintext DEK bytes. The caller is responsible for scrubbing memory with
+// encryption.ZeroBytes(dek) when done.
+func (e *Envelope) UnwrapDEK(systemKeyID string, encryptedDEK []byte) ([]byte, error) {
+	sysKey, err := e.keyring.Key(systemKeyID)
+	if err != nil {
+		return nil, fmt.Errorf("envelope unwrap DEK: get system key %q: %w", systemKeyID, err)
+	}
+
+	dek, err := e.cipher.Decrypt(sysKey, encryptedDEK)
+	if err != nil {
+		return nil, fmt.Errorf("envelope unwrap DEK: %w", err)
+	}
+
+	return dek, nil
+}
+
+// GenerateDEK generates a new cryptographically secure random DEK matching the cipher's key size.
+// The caller is responsible for scrubbing memory with encryption.ZeroBytes(dek) when done.
+func (e *Envelope) GenerateDEK() ([]byte, error) {
+	dek := make([]byte, e.cipher.KeySize())
+	if _, err := io.ReadFull(rand.Reader, dek); err != nil {
+		encryption.ZeroBytes(dek)
+		return nil, fmt.Errorf("envelope generate DEK: %w", err)
+	}
+	return dek, nil
+}
+
+// ActiveKeyID returns the active system key ID from the keyring.
+func (e *Envelope) ActiveKeyID() string {
+	_, id := e.keyring.ActiveKey()
+	return id
 }

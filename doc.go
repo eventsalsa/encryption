@@ -1,24 +1,15 @@
-// Package encryption provides envelope encryption for event-sourced systems.
-//
-// It supports two encryption categories with distinct semantics:
-//
-//   - PII (Personally Identifiable Information): per-subject encryption keys
-//     with no rotation, supporting GDPR crypto-shredding via key destruction.
-//   - Secrets (API credentials, tokens): versioned encryption keys with
-//     rotation support, where old ciphertext remains decryptable.
+// Package encryption provides envelope encryption for Go systems.
 //
 // # Architecture
 //
 // The library uses envelope encryption: data is encrypted with a Data Encryption
 // Key (DEK), and the DEK is encrypted with a system Key Encryption Key (KEK).
 //
-//   - cipher/: pluggable symmetric encryption (default: AES-256-GCM)
-//   - systemkey/: system key (KEK) management
-//   - keystore/: encrypted DEK persistence
+//   - cipher/: pluggable symmetric encryption interface and implementations (AES-256-GCM)
+//   - systemkey/: system key (KEK) management abstractions
+//   - keystore/: encrypted DEK persistence abstractions and PostgreSQL implementation
 //   - keymanager/: key lifecycle (create, rotate, revoke, destroy)
-//   - envelope/: envelope encryption engine
-//   - pii/: PII value types and adapters
-//   - secret/: secret value types and adapters
+//   - envelope/: pure in-memory envelope encryption engine
 //   - hash/: deterministic HMAC-SHA256 hashing
 //
 // # Quick Start

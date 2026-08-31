@@ -7,8 +7,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/eventsalsa/encryption"
+	encryption "github.com/eventsalsa/encryption/encerr"
 	"github.com/eventsalsa/encryption/keystore"
+	"github.com/eventsalsa/encryption/keystore/postgres"
 	"github.com/eventsalsa/encryption/systemkey"
 )
 
@@ -22,7 +23,7 @@ func NewTestKeyring() systemkey.Keyring {
 	return systemkey.NewKeyring(map[string][]byte{"test-key-1": key}, "test-key-1")
 }
 
-// InMemoryKeyStore implements keystore.KeyStore using an in-memory map.
+// InMemoryKeyStore implements KeyStore using an in-memory map.
 // Safe for concurrent use. Intended for unit testing only.
 type InMemoryKeyStore struct {
 	mu   sync.RWMutex
@@ -39,7 +40,7 @@ func NewInMemoryKeyStore() *InMemoryKeyStore {
 func bucketKey(scope, scopeID string) string { return scope + ":" + scopeID }
 
 // GetActiveKey returns the latest non-revoked key by highest KeyVersion.
-func (s *InMemoryKeyStore) GetActiveKey(_ context.Context, scope, scopeID string) (*keystore.EncryptedKey, error) {
+func (s *InMemoryKeyStore) GetActiveKey(_ context.Context, _ postgres.PgxConn, scope, scopeID string) (*keystore.EncryptedKey, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -61,7 +62,7 @@ func (s *InMemoryKeyStore) GetActiveKey(_ context.Context, scope, scopeID string
 }
 
 // GetKey returns the key with the exact version.
-func (s *InMemoryKeyStore) GetKey(_ context.Context, scope, scopeID string, version int) (*keystore.EncryptedKey, error) {
+func (s *InMemoryKeyStore) GetKey(_ context.Context, _ postgres.PgxConn, scope, scopeID string, version int) (*keystore.EncryptedKey, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -76,7 +77,7 @@ func (s *InMemoryKeyStore) GetKey(_ context.Context, scope, scopeID string, vers
 }
 
 // CreateKey appends a new EncryptedKey to the store.
-func (s *InMemoryKeyStore) CreateKey(_ context.Context, scope, scopeID string, version int, encryptedDEK []byte, systemKeyID string) error {
+func (s *InMemoryKeyStore) CreateKey(_ context.Context, _ postgres.PgxConn, scope, scopeID string, version int, encryptedDEK []byte, systemKeyID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -94,7 +95,7 @@ func (s *InMemoryKeyStore) CreateKey(_ context.Context, scope, scopeID string, v
 
 // RevokeKeys marks all non-revoked keys for scope:scopeID as revoked,
 // except the one with the highest version (the active key).
-func (s *InMemoryKeyStore) RevokeKeys(_ context.Context, scope, scopeID string) error {
+func (s *InMemoryKeyStore) RevokeKeys(_ context.Context, _ postgres.PgxConn, scope, scopeID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -116,7 +117,7 @@ func (s *InMemoryKeyStore) RevokeKeys(_ context.Context, scope, scopeID string) 
 }
 
 // DestroyKeys removes all keys for scope:scopeID.
-func (s *InMemoryKeyStore) DestroyKeys(_ context.Context, scope, scopeID string) error {
+func (s *InMemoryKeyStore) DestroyKeys(_ context.Context, _ postgres.PgxConn, scope, scopeID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 

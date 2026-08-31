@@ -5,21 +5,20 @@ import (
 	"github.com/eventsalsa/encryption/envelope"
 	"github.com/eventsalsa/encryption/hash"
 	"github.com/eventsalsa/encryption/keymanager"
-	"github.com/eventsalsa/encryption/keystore"
 	"github.com/eventsalsa/encryption/systemkey"
 )
 
 // Config holds all configuration needed for the encryption module.
 type Config struct {
 	Keyring systemkey.Keyring
-	Store   keystore.KeyStore
+	Store   keymanager.KeyStore
 	Cipher  cipher.Cipher // optional — defaults to AES-256-GCM
 }
 
 // Module is the assembled encryption module providing all components.
 type Module struct {
 	KeyManager *keymanager.Manager
-	Envelope   *envelope.Encryptor
+	Envelope   *envelope.Envelope
 	Hasher     hash.Hasher // nil if no HMAC key provided
 }
 
@@ -34,9 +33,10 @@ func New(cfg Config) *Module {
 		}
 		c = DefaultCipherFactory()
 	}
+	env := envelope.New(cfg.Keyring, c)
 	return &Module{
-		KeyManager: keymanager.New(cfg.Keyring, cfg.Store, c),
-		Envelope:   envelope.NewEncryptor(cfg.Keyring, cfg.Store, c),
+		KeyManager: keymanager.New(cfg.Store, env),
+		Envelope:   env,
 	}
 }
 
@@ -59,8 +59,8 @@ func WithHMACKey(key []byte) Option {
 }
 
 // NewWithDefaults creates a module with AES-256-GCM cipher.
-// Provide a KeyStore and Keyring; use options for additional configuration.
-func NewWithDefaults(keyring systemkey.Keyring, store keystore.KeyStore, opts ...Option) *Module {
+// Provide a Keyring and Store; use options for additional configuration.
+func NewWithDefaults(keyring systemkey.Keyring, store keymanager.KeyStore, opts ...Option) *Module {
 	o := &options{}
 	for _, opt := range opts {
 		opt(o)

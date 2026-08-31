@@ -7,10 +7,12 @@ import (
 	"testing"
 	"time"
 
-	encryption "github.com/eventsalsa/encryption"
 	"github.com/eventsalsa/encryption/cipher/aesgcm"
+	encryption "github.com/eventsalsa/encryption/encerr"
+	"github.com/eventsalsa/encryption/envelope"
 	"github.com/eventsalsa/encryption/keymanager"
 	"github.com/eventsalsa/encryption/keystore"
+	"github.com/eventsalsa/encryption/keystore/postgres"
 	"github.com/eventsalsa/encryption/systemkey"
 )
 
@@ -26,7 +28,7 @@ func newMockKeyStore() *mockKeyStore {
 
 func keyID(scope, scopeID string) string { return scope + ":" + scopeID }
 
-func (s *mockKeyStore) GetActiveKey(_ context.Context, scope, scopeID string) (*keystore.EncryptedKey, error) {
+func (s *mockKeyStore) GetActiveKey(_ context.Context, _ postgres.PgxConn, scope, scopeID string) (*keystore.EncryptedKey, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -39,7 +41,7 @@ func (s *mockKeyStore) GetActiveKey(_ context.Context, scope, scopeID string) (*
 	return nil, encryption.ErrKeyNotFound
 }
 
-func (s *mockKeyStore) GetKey(_ context.Context, scope, scopeID string, version int) (*keystore.EncryptedKey, error) {
+func (s *mockKeyStore) GetKey(_ context.Context, _ postgres.PgxConn, scope, scopeID string, version int) (*keystore.EncryptedKey, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -51,7 +53,7 @@ func (s *mockKeyStore) GetKey(_ context.Context, scope, scopeID string, version 
 	return nil, encryption.ErrKeyNotFound
 }
 
-func (s *mockKeyStore) CreateKey(_ context.Context, scope, scopeID string, version int, encryptedDEK []byte, systemKeyID string) error {
+func (s *mockKeyStore) CreateKey(_ context.Context, _ postgres.PgxConn, scope, scopeID string, version int, encryptedDEK []byte, systemKeyID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -67,7 +69,7 @@ func (s *mockKeyStore) CreateKey(_ context.Context, scope, scopeID string, versi
 	return nil
 }
 
-func (s *mockKeyStore) RevokeKeys(_ context.Context, scope, scopeID string) error {
+func (s *mockKeyStore) RevokeKeys(_ context.Context, _ postgres.PgxConn, scope, scopeID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -86,7 +88,7 @@ func (s *mockKeyStore) RevokeKeys(_ context.Context, scope, scopeID string) erro
 	return nil
 }
 
-func (s *mockKeyStore) DestroyKeys(_ context.Context, scope, scopeID string) error {
+func (s *mockKeyStore) DestroyKeys(_ context.Context, _ postgres.PgxConn, scope, scopeID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -102,14 +104,15 @@ func setup() (*keymanager.Manager, *mockKeyStore) {
 	keyring := systemkey.NewKeyring(map[string][]byte{"sk-1": sysKey}, "sk-1")
 	store := newMockKeyStore()
 	c := aesgcm.New()
-	return keymanager.New(keyring, store, c), store
+	env := envelope.New(keyring, c)
+	return keymanager.New(store, env), store
 }
 
 func TestCreateKey(t *testing.T) {
 	mgr, _ := setup()
 	ctx := context.Background()
 
-	version, err := mgr.CreateKey(ctx, "user", "u-1")
+	version, err := mgr.CreateKey(ctx, nil, "user", "u-1")
 	if err != nil {
 		t.Fatalf("CreateKey: unexpected error: %v", err)
 	}
@@ -122,11 +125,11 @@ func TestCreateKeyExists(t *testing.T) {
 	mgr, _ := setup()
 	ctx := context.Background()
 
-	if _, err := mgr.CreateKey(ctx, "user", "u-1"); err != nil {
+	if _, err := mgr.CreateKey(ctx, nil, "user", "u-1"); err != nil {
 		t.Fatalf("first CreateKey: %v", err)
 	}
 
-	_, err := mgr.CreateKey(ctx, "user", "u-1")
+	_, err := mgr.CreateKey(ctx, nil, "user", "u-1")
 	if !errors.Is(err, encryption.ErrKeyExists) {
 		t.Fatalf("second CreateKey: expected ErrKeyExists, got %v", err)
 	}
@@ -136,11 +139,11 @@ func TestRotateKey(t *testing.T) {
 	mgr, store := setup()
 	ctx := context.Background()
 
-	if _, err := mgr.CreateKey(ctx, "user", "u-1"); err != nil {
+	if _, err := mgr.CreateKey(ctx, nil, "user", "u-1"); err != nil {
 		t.Fatalf("CreateKey: %v", err)
 	}
 
-	version, err := mgr.RotateKey(ctx, "user", "u-1")
+	version, err := mgr.RotateKey(ctx, nil, "user", "u-1")
 	if err != nil {
 		t.Fatalf("RotateKey: unexpected error: %v", err)
 	}
@@ -162,17 +165,17 @@ func TestRotateKeyLeavesNewVersionActive(t *testing.T) {
 	mgr, store := setup()
 	ctx := context.Background()
 
-	if _, err := mgr.CreateKey(ctx, "user", "u-1"); err != nil {
+	if _, err := mgr.CreateKey(ctx, nil, "user", "u-1"); err != nil {
 		t.Fatalf("CreateKey: %v", err)
 	}
 
-	newVer, err := mgr.RotateKey(ctx, "user", "u-1")
+	newVer, err := mgr.RotateKey(ctx, nil, "user", "u-1")
 	if err != nil {
 		t.Fatalf("RotateKey: %v", err)
 	}
 
 	// The rotated key must be active (not revoked).
-	active, err := store.GetActiveKey(ctx, "user", "u-1")
+	active, err := store.GetActiveKey(ctx, nil, "user", "u-1")
 	if err != nil {
 		t.Fatalf("GetActiveKey after rotate: %v", err)
 	}
@@ -184,7 +187,7 @@ func TestRotateKeyLeavesNewVersionActive(t *testing.T) {
 	}
 
 	// The old key must be revoked.
-	old, err := store.GetKey(ctx, "user", "u-1", 1)
+	old, err := store.GetKey(ctx, nil, "user", "u-1", 1)
 	if err != nil {
 		t.Fatalf("GetKey(v1) after rotate: %v", err)
 	}
@@ -197,7 +200,7 @@ func TestRotateKeyNotFound(t *testing.T) {
 	mgr, _ := setup()
 	ctx := context.Background()
 
-	_, err := mgr.RotateKey(ctx, "user", "u-1")
+	_, err := mgr.RotateKey(ctx, nil, "user", "u-1")
 	if !errors.Is(err, encryption.ErrKeyNotFound) {
 		t.Fatalf("RotateKey: expected ErrKeyNotFound, got %v", err)
 	}
@@ -207,11 +210,11 @@ func TestDestroyKeys(t *testing.T) {
 	mgr, store := setup()
 	ctx := context.Background()
 
-	if _, err := mgr.CreateKey(ctx, "user", "u-1"); err != nil {
+	if _, err := mgr.CreateKey(ctx, nil, "user", "u-1"); err != nil {
 		t.Fatalf("CreateKey: %v", err)
 	}
 
-	if err := mgr.DestroyKeys(ctx, "user", "u-1"); err != nil {
+	if err := mgr.DestroyKeys(ctx, nil, "user", "u-1"); err != nil {
 		t.Fatalf("DestroyKeys: %v", err)
 	}
 
@@ -227,11 +230,11 @@ func TestActiveKeyVersion(t *testing.T) {
 	mgr, _ := setup()
 	ctx := context.Background()
 
-	if _, err := mgr.CreateKey(ctx, "user", "u-1"); err != nil {
+	if _, err := mgr.CreateKey(ctx, nil, "user", "u-1"); err != nil {
 		t.Fatalf("CreateKey: %v", err)
 	}
 
-	version, err := mgr.ActiveKeyVersion(ctx, "user", "u-1")
+	version, err := mgr.ActiveKeyVersion(ctx, nil, "user", "u-1")
 	if err != nil {
 		t.Fatalf("ActiveKeyVersion: %v", err)
 	}
@@ -239,11 +242,11 @@ func TestActiveKeyVersion(t *testing.T) {
 		t.Fatalf("ActiveKeyVersion: expected 1, got %d", version)
 	}
 
-	if _, err := mgr.RotateKey(ctx, "user", "u-1"); err != nil {
+	if _, err := mgr.RotateKey(ctx, nil, "user", "u-1"); err != nil {
 		t.Fatalf("RotateKey: %v", err)
 	}
 
-	version, err = mgr.ActiveKeyVersion(ctx, "user", "u-1")
+	version, err = mgr.ActiveKeyVersion(ctx, nil, "user", "u-1")
 	if err != nil {
 		t.Fatalf("ActiveKeyVersion after rotate: %v", err)
 	}

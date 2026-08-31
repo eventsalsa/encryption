@@ -8,11 +8,12 @@ import (
 	encryption "github.com/eventsalsa/encryption/encerr"
 	"github.com/eventsalsa/encryption/systemkey"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 const defaultRewrapBatchSize = 100
 
-// RewrapSystemKeysOptions configures Store.RewrapSystemKeys.
+// RewrapSystemKeysOptions configures RewrapSystemKeys.
 type RewrapSystemKeysOptions struct {
 	FromSystemKeyID string
 	ToSystemKeyID   string
@@ -61,7 +62,10 @@ func (o RewrapSystemKeysOptions) normalize() (RewrapSystemKeysOptions, error) {
 // This is an administrative operation for retiring old system keys. It updates
 // only the stored encrypted DEK and system_key_id for matching rows; it does
 // not create new DEK versions or touch application ciphertext.
-func (s *Store) RewrapSystemKeys(ctx context.Context, keyring systemkey.Keyring, c cipher.Cipher, opts RewrapSystemKeysOptions) (RewrapSystemKeysResult, error) {
+func RewrapSystemKeys(ctx context.Context, pool *pgxpool.Pool, cfg Config, keyring systemkey.Keyring, c cipher.Cipher, opts RewrapSystemKeysOptions) (RewrapSystemKeysResult, error) {
+	if pool == nil {
+		return RewrapSystemKeysResult{}, fmt.Errorf("postgres rewrap: pool is nil")
+	}
 	if keyring == nil {
 		return RewrapSystemKeysResult{}, fmt.Errorf("postgres rewrap: keyring is nil")
 	}
@@ -69,6 +73,7 @@ func (s *Store) RewrapSystemKeys(ctx context.Context, keyring systemkey.Keyring,
 		return RewrapSystemKeysResult{}, fmt.Errorf("postgres rewrap: cipher is nil")
 	}
 
+	cfg = ApplyDefaults(cfg)
 	opts, err := opts.normalize()
 	if err != nil {
 		return RewrapSystemKeysResult{}, fmt.Errorf("postgres rewrap: %w", err)
@@ -83,8 +88,10 @@ func (s *Store) RewrapSystemKeys(ctx context.Context, keyring systemkey.Keyring,
 		return RewrapSystemKeysResult{}, fmt.Errorf("postgres rewrap: get target system key: %w", err)
 	}
 
+	fqtn := fmt.Sprintf("%s.%s", cfg.Schema, cfg.Table)
+
 	if opts.DryRun {
-		remaining, err := s.countRowsBySystemKey(ctx, s.db, opts.FromSystemKeyID)
+		remaining, err := countRowsBySystemKey(ctx, pool, fqtn, opts.FromSystemKeyID)
 		if err != nil {
 			return RewrapSystemKeysResult{}, fmt.Errorf("postgres rewrap: count dry-run rows: %w", err)
 		}
@@ -96,7 +103,7 @@ func (s *Store) RewrapSystemKeys(ctx context.Context, keyring systemkey.Keyring,
 
 	var result RewrapSystemKeysResult
 	for {
-		batch, err := s.rewrapSystemKeyBatch(ctx, sourceKey, targetKey, c, opts)
+		batch, err := rewrapSystemKeyBatch(ctx, pool, fqtn, sourceKey, targetKey, c, opts)
 		if err != nil {
 			return RewrapSystemKeysResult{}, err
 		}
@@ -110,7 +117,7 @@ func (s *Store) RewrapSystemKeys(ctx context.Context, keyring systemkey.Keyring,
 		result.Batches += batch.Batches
 	}
 
-	remaining, err := s.countRowsBySystemKey(ctx, s.db, opts.FromSystemKeyID)
+	remaining, err := countRowsBySystemKey(ctx, pool, fqtn, opts.FromSystemKeyID)
 	if err != nil {
 		return RewrapSystemKeysResult{}, fmt.Errorf("postgres rewrap: count remaining rows: %w", err)
 	}
@@ -119,14 +126,14 @@ func (s *Store) RewrapSystemKeys(ctx context.Context, keyring systemkey.Keyring,
 	return result, nil
 }
 
-func (s *Store) rewrapSystemKeyBatch(ctx context.Context, sourceKey, targetKey []byte, c cipher.Cipher, opts RewrapSystemKeysOptions) (RewrapSystemKeysResult, error) {
-	tx, err := s.db.Begin(ctx)
+func rewrapSystemKeyBatch(ctx context.Context, pool *pgxpool.Pool, fqtn string, sourceKey, targetKey []byte, c cipher.Cipher, opts RewrapSystemKeysOptions) (RewrapSystemKeysResult, error) {
+	tx, err := pool.Begin(ctx)
 	if err != nil {
 		return RewrapSystemKeysResult{}, fmt.Errorf("postgres rewrap: begin batch tx: %w", err)
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck // Best-effort cleanup; commit path handles the success case explicitly.
 
-	candidates, err := s.selectRowsForRewrap(ctx, tx, opts.FromSystemKeyID, opts.BatchSize)
+	candidates, err := selectRowsForRewrap(ctx, tx, fqtn, opts.FromSystemKeyID, opts.BatchSize)
 	if err != nil {
 		return RewrapSystemKeysResult{}, fmt.Errorf("postgres rewrap: select batch: %w", err)
 	}
@@ -144,7 +151,7 @@ func (s *Store) rewrapSystemKeyBatch(ctx context.Context, sourceKey, targetKey [
 			return RewrapSystemKeysResult{}, fmt.Errorf("postgres rewrap: rewrap batch row %d: %w", i, err)
 		}
 
-		updated, err := s.updateRewrappedRow(ctx, tx, candidate, rewrappedDEK, opts)
+		updated, err := updateRewrappedRow(ctx, tx, fqtn, candidate, rewrappedDEK, opts)
 		if err != nil {
 			return RewrapSystemKeysResult{}, fmt.Errorf("postgres rewrap: update batch row %d: %w", i, err)
 		}
@@ -172,13 +179,13 @@ func rewrapDEK(encryptedDEK, sourceKey, targetKey []byte, c cipher.Cipher) ([]by
 	return c.Encrypt(targetKey, dek)
 }
 
-func (s *Store) selectRowsForRewrap(ctx context.Context, tx pgx.Tx, systemKeyID string, batchSize int) ([]rewrapCandidate, error) {
+func selectRowsForRewrap(ctx context.Context, tx pgx.Tx, fqtn, systemKeyID string, batchSize int) ([]rewrapCandidate, error) {
 	query := fmt.Sprintf(`SELECT scope, scope_id, key_version, encrypted_key
 		FROM %s
 		WHERE system_key_id = $1
 		ORDER BY scope, scope_id, key_version
 		LIMIT $2
-		FOR UPDATE SKIP LOCKED`, s.fqtn()) //#nosec G201 -- fqtn is derived from trusted postgres.Config schema/table settings, not user input.
+		FOR UPDATE SKIP LOCKED`, fqtn) //#nosec G201 -- fqtn is derived from trusted postgres.Config schema/table settings, not user input.
 
 	rows, err := tx.Query(ctx, query, systemKeyID, batchSize)
 	if err != nil {
@@ -201,10 +208,10 @@ func (s *Store) selectRowsForRewrap(ctx context.Context, tx pgx.Tx, systemKeyID 
 	return candidates, nil
 }
 
-func (s *Store) updateRewrappedRow(ctx context.Context, tx pgx.Tx, candidate rewrapCandidate, encryptedDEK []byte, opts RewrapSystemKeysOptions) (int64, error) {
+func updateRewrappedRow(ctx context.Context, tx pgx.Tx, fqtn string, candidate rewrapCandidate, encryptedDEK []byte, opts RewrapSystemKeysOptions) (int64, error) {
 	query := fmt.Sprintf(`UPDATE %s
 		SET encrypted_key = $1, system_key_id = $2
-		WHERE scope = $3 AND scope_id = $4 AND key_version = $5 AND system_key_id = $6`, s.fqtn()) //#nosec G201 -- fqtn is derived from trusted postgres.Config schema/table settings, not user input.
+		WHERE scope = $3 AND scope_id = $4 AND key_version = $5 AND system_key_id = $6`, fqtn) //#nosec G201 -- fqtn is derived from trusted postgres.Config schema/table settings, not user input.
 
 	cmdTag, err := tx.Exec(
 		ctx,
@@ -222,10 +229,10 @@ func (s *Store) updateRewrappedRow(ctx context.Context, tx pgx.Tx, candidate rew
 	return cmdTag.RowsAffected(), nil
 }
 
-func (s *Store) countRowsBySystemKey(ctx context.Context, conn queryable, systemKeyID string) (int, error) {
+func countRowsBySystemKey(ctx context.Context, conn pgxConn, fqtn, systemKeyID string) (int, error) {
 	query := fmt.Sprintf(`SELECT COUNT(*)
 		FROM %s
-		WHERE system_key_id = $1`, s.fqtn())
+		WHERE system_key_id = $1`, fqtn)
 
 	var count int
 	if err := conn.QueryRow(ctx, query, systemKeyID).Scan(&count); err != nil {

@@ -1,4 +1,4 @@
-// Example: PII encryption with crypto-shredding.
+// Example: GDPR PII encryption and crypto-shredding.
 package main
 
 import (
@@ -8,16 +8,11 @@ import (
 	"log"
 
 	"github.com/eventsalsa/encryption"
-	"github.com/eventsalsa/encryption/pii"
+	"github.com/eventsalsa/encryption/encerr"
 	"github.com/eventsalsa/encryption/testutil"
 
 	_ "github.com/eventsalsa/encryption/cipher/aesgcm"
 )
-
-// userID implements fmt.Stringer so it can be used as a PII subject ID.
-type userID string
-
-func (u userID) String() string { return string(u) }
 
 func main() {
 	ctx := context.Background()
@@ -30,47 +25,50 @@ func main() {
 		Store:   store,
 	})
 
-	// Create a PII adapter for the "pii_email" scope.
-	adapter := pii.NewAdapter[userID](mod.Envelope, "pii_email")
+	scope, userID := "pii_email", "user-99"
 
-	uid := userID("user-99")
-
-	// Create a DEK for this user's PII.
-	_, err := mod.KeyManager.CreateKey(ctx, "pii_email", uid.String())
+	// 1. Create a DEK for this user's PII.
+	_, err := mod.KeyManager.CreateKey(ctx, nil, scope, userID)
 	if err != nil {
 		log.Fatal("CreateKey: ", err)
 	}
 
-	// Encrypt an email address.
+	// 2. Fetch the active key.
+	key, err := store.GetActiveKey(ctx, nil, scope, userID)
+	if err != nil {
+		log.Fatal("GetActiveKey: ", err)
+	}
+
+	// 3. Encrypt the email address.
 	email := "alice@example.com"
-	encrypted, err := adapter.Encrypt(ctx, uid, email)
+	encrypted, err := mod.Envelope.Encrypt(key.SystemKeyID, key.EncryptedDEK, email)
 	if err != nil {
 		log.Fatal("Encrypt: ", err)
 	}
 	fmt.Printf("Encrypted email: %s\n", encrypted)
 
-	// Decrypt it back.
-	decrypted, err := adapter.Decrypt(ctx, uid, encrypted)
+	// 4. Decrypt it back.
+	decrypted, err := mod.Envelope.Decrypt(key.SystemKeyID, key.EncryptedDEK, encrypted)
 	if err != nil {
 		log.Fatal("Decrypt: ", err)
 	}
 	fmt.Printf("Decrypted email: %s\n", decrypted)
 
-	// --- Crypto-shredding: destroy all keys for this user ---
+	// --- 5. Crypto-shredding: destroy all keys for this user ---
 	fmt.Println("\nDestroying keys (crypto-shredding)...")
-	if err := mod.KeyManager.DestroyKeys(ctx, "pii_email", uid.String()); err != nil {
+	if err := mod.KeyManager.DestroyKeys(ctx, nil, scope, userID); err != nil {
 		log.Fatal("DestroyKeys: ", err)
 	}
 
-	// Attempt to decrypt after key destruction — must fail.
-	_, err = adapter.Decrypt(ctx, uid, encrypted)
+	// 6. Attempt to fetch key after key destruction — must fail.
+	_, err = store.GetActiveKey(ctx, nil, scope, userID)
 	if err == nil {
-		log.Fatal("expected error after crypto-shredding, got nil")
+		log.Fatal("expected error fetching key after crypto-shredding, got nil")
 	}
-	if errors.Is(err, encryption.ErrKeyNotFound) {
-		fmt.Println("Decrypt after shredding: ErrKeyNotFound (as expected)")
+	if errors.Is(err, encerr.ErrKeyNotFound) {
+		fmt.Println("Fetch key after shredding: ErrKeyNotFound (as expected)")
 	} else {
-		fmt.Printf("Decrypt after shredding: %v\n", err)
+		fmt.Printf("Fetch key after shredding: %v\n", err)
 	}
 
 	fmt.Println("\n✓ PII is permanently unreadable after crypto-shredding.")
