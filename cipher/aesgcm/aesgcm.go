@@ -9,7 +9,6 @@ import (
 	"io"
 
 	"github.com/eventsalsa/encryption"
-	"github.com/eventsalsa/encryption/cipher"
 )
 
 const (
@@ -21,10 +20,6 @@ const (
 // Ciphertext format: [12-byte nonce][ciphertext][16-byte GCM auth tag].
 // Safe for concurrent use.
 type Cipher struct{}
-
-func init() {
-	encryption.DefaultCipherFactory = func() cipher.Cipher { return New() }
-}
 
 // New returns a new AES-256-GCM cipher.
 func New() *Cipher {

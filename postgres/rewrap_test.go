@@ -7,7 +7,7 @@ import (
 
 	"github.com/eventsalsa/encryption/cipher"
 	"github.com/eventsalsa/encryption/cipher/aesgcm"
-	"github.com/eventsalsa/encryption/keystore/postgres"
+	"github.com/eventsalsa/encryption/postgres"
 	"github.com/eventsalsa/encryption/systemkey"
 	"github.com/jackc/pgx/v5/pgxpool"
 )

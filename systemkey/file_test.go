@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/eventsalsa/encryption/encerr"
+	"github.com/eventsalsa/encryption"
 )
 
 func writeKeyFile(t *testing.T, dir, name string, data []byte) string {
@@ -80,7 +80,7 @@ func TestNewKeyringFromFiles_WrongKeySize(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for wrong key size")
 	}
-	if !errors.Is(err, encerr.ErrInvalidKeySize) {
-		t.Fatalf("error = %v, want %v", err, encerr.ErrInvalidKeySize)
+	if !errors.Is(err, encryption.ErrInvalidKeySize) {
+		t.Fatalf("error = %v, want %v", err, encryption.ErrInvalidKeySize)
 	}
 }

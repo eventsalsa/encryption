@@ -9,8 +9,8 @@ import (
 	"fmt"
 	"io"
 
+	"github.com/eventsalsa/encryption"
 	"github.com/eventsalsa/encryption/cipher"
-	encryption "github.com/eventsalsa/encryption/encerr"
 	"github.com/eventsalsa/encryption/systemkey"
 )
 

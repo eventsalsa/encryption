@@ -11,11 +11,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/eventsalsa/encryption"
 	"github.com/eventsalsa/encryption/cipher/aesgcm"
-	encryption "github.com/eventsalsa/encryption/encerr"
 	"github.com/eventsalsa/encryption/envelope"
-	"github.com/eventsalsa/encryption/keystore/postgres"
-	"github.com/eventsalsa/encryption/keystore/postgres/migrations"
+	"github.com/eventsalsa/encryption/postgres"
+	"github.com/eventsalsa/encryption/postgres/migrations"
 	"github.com/eventsalsa/encryption/systemkey"
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -74,15 +74,25 @@ func setupPostgres(t *testing.T) *pgxpool.Pool {
 	return db
 }
 
-func mustStoreEncryptedKey(t *testing.T, store *postgres.Store, ctx context.Context, conn postgres.PgxConn, c *aesgcm.Cipher, systemKey []byte, systemKeyID, scope, scopeID string, version int, dek []byte) {
+func setupTestStore(t *testing.T) (*postgres.Store, *envelope.Envelope) {
+	t.Helper()
+	c := aesgcm.New()
+	key := makeSystemKey(1)
+	keyring := systemkey.NewKeyring(map[string][]byte{"sys-key-1": key}, "sys-key-1")
+	env := envelope.New(keyring, c)
+	return postgres.NewStore(env, postgres.Config{}), env
+}
+
+func mustStoreRawEncryptedKey(t *testing.T, ctx context.Context, pool *pgxpool.Pool, c *aesgcm.Cipher, systemKey []byte, systemKeyID, scope, scopeID string, version int, dek []byte) {
 	t.Helper()
 
 	encryptedDEK, err := c.Encrypt(systemKey, dek)
 	if err != nil {
 		t.Fatalf("encrypt DEK: %v", err)
 	}
-	if err := store.CreateKey(ctx, conn, scope, scopeID, version, encryptedDEK, systemKeyID); err != nil {
-		t.Fatalf("CreateKey: %v", err)
+	query := "INSERT INTO infrastructure.encryption_keys (scope, scope_id, key_version, encrypted_key, system_key_id) VALUES ($1, $2, $3, $4, $5)"
+	if _, err := pool.Exec(ctx, query, scope, scopeID, version, encryptedDEK, systemKeyID); err != nil {
+		t.Fatalf("insert raw key fixture: %v", err)
 	}
 }
 
@@ -97,17 +107,20 @@ func mustDecryptDEK(t *testing.T, c *aesgcm.Cipher, systemKey []byte, encryptedD
 }
 
 // ---------------------------------------------------------------------------
-// Basic CRUD
+// Basic CRUD & Lifecycle
 // ---------------------------------------------------------------------------
 
 func TestCreateAndGetActiveKey(t *testing.T) {
 	db := setupPostgres(t)
-	store := postgres.NewStore(postgres.Config{})
+	store, env := setupTestStore(t)
 	ctx := context.Background()
 
-	err := store.CreateKey(ctx, db, "user", "u-1", 1, []byte("enc-dek-1"), "sys-key-1")
+	v, err := store.CreateKey(ctx, db, "user", "u-1")
 	if err != nil {
 		t.Fatalf("CreateKey: %v", err)
+	}
+	if v != 1 {
+		t.Fatalf("expected version 1, got %d", v)
 	}
 
 	key, err := store.GetActiveKey(ctx, db, "user", "u-1")
@@ -117,45 +130,95 @@ func TestCreateAndGetActiveKey(t *testing.T) {
 	if key.KeyVersion != 1 {
 		t.Fatalf("expected version 1, got %d", key.KeyVersion)
 	}
-	if string(key.EncryptedDEK) != "enc-dek-1" {
-		t.Fatalf("expected enc-dek-1, got %s", key.EncryptedDEK)
-	}
 	if key.SystemKeyID != "sys-key-1" {
 		t.Fatalf("expected sys-key-1, got %s", key.SystemKeyID)
 	}
 	if key.RevokedAt != nil {
 		t.Fatal("new key should not be revoked")
 	}
+
+	// Verify the DEK can be unwrapped and used by env
+	ct, err := env.Encrypt(key.SystemKeyID, key.EncryptedDEK, "hello world")
+	if err != nil {
+		t.Fatalf("Encrypt with active key: %v", err)
+	}
+	pt, err := env.Decrypt(key.SystemKeyID, key.EncryptedDEK, ct)
+	if err != nil {
+		t.Fatalf("Decrypt: %v", err)
+	}
+	if pt != "hello world" {
+		t.Fatalf("pt = %q, want %q", pt, "hello world")
+	}
+}
+
+func TestRotateKey(t *testing.T) {
+	db := setupPostgres(t)
+	store, _ := setupTestStore(t)
+	ctx := context.Background()
+
+	v1, err := store.CreateKey(ctx, db, "secret", "s-1")
+	if err != nil {
+		t.Fatalf("CreateKey: %v", err)
+	}
+	if v1 != 1 {
+		t.Fatalf("expected version 1, got %d", v1)
+	}
+
+	v2, err := store.RotateKey(ctx, db, "secret", "s-1")
+	if err != nil {
+		t.Fatalf("RotateKey: %v", err)
+	}
+	if v2 != 2 {
+		t.Fatalf("expected version 2, got %d", v2)
+	}
+
+	// Active key is v2
+	active, err := store.GetActiveKey(ctx, db, "secret", "s-1")
+	if err != nil {
+		t.Fatalf("GetActiveKey: %v", err)
+	}
+	if active.KeyVersion != 2 {
+		t.Fatalf("expected active version 2, got %d", active.KeyVersion)
+	}
+
+	// v1 is revoked
+	k1, err := store.GetKey(ctx, db, "secret", "s-1", 1)
+	if err != nil {
+		t.Fatalf("GetKey v1: %v", err)
+	}
+	if k1.RevokedAt == nil {
+		t.Fatal("v1 should be revoked")
+	}
 }
 
 func TestGetKeyByVersion(t *testing.T) {
 	db := setupPostgres(t)
-	store := postgres.NewStore(postgres.Config{})
+	store, _ := setupTestStore(t)
 	ctx := context.Background()
 
-	_ = store.CreateKey(ctx, db, "s", "id", 1, []byte("v1"), "sk")
-	_ = store.CreateKey(ctx, db, "s", "id", 2, []byte("v2"), "sk")
+	_, _ = store.CreateKey(ctx, db, "s", "id")
+	_, _ = store.RotateKey(ctx, db, "s", "id")
 
 	k1, err := store.GetKey(ctx, db, "s", "id", 1)
 	if err != nil {
 		t.Fatalf("GetKey v1: %v", err)
 	}
-	if string(k1.EncryptedDEK) != "v1" {
-		t.Fatalf("v1 DEK mismatch: %s", k1.EncryptedDEK)
+	if k1.KeyVersion != 1 {
+		t.Fatalf("expected version 1, got %d", k1.KeyVersion)
 	}
 
 	k2, err := store.GetKey(ctx, db, "s", "id", 2)
 	if err != nil {
 		t.Fatalf("GetKey v2: %v", err)
 	}
-	if string(k2.EncryptedDEK) != "v2" {
-		t.Fatalf("v2 DEK mismatch: %s", k2.EncryptedDEK)
+	if k2.KeyVersion != 2 {
+		t.Fatalf("expected version 2, got %d", k2.KeyVersion)
 	}
 }
 
 func TestGetActiveKey_NotFound(t *testing.T) {
 	db := setupPostgres(t)
-	store := postgres.NewStore(postgres.Config{})
+	store, _ := setupTestStore(t)
 	ctx := context.Background()
 
 	_, err := store.GetActiveKey(ctx, db, "no", "key")
@@ -166,7 +229,7 @@ func TestGetActiveKey_NotFound(t *testing.T) {
 
 func TestGetKey_NotFound(t *testing.T) {
 	db := setupPostgres(t)
-	store := postgres.NewStore(postgres.Config{})
+	store, _ := setupTestStore(t)
 	ctx := context.Background()
 
 	_, err := store.GetKey(ctx, db, "no", "key", 1)
@@ -175,36 +238,14 @@ func TestGetKey_NotFound(t *testing.T) {
 	}
 }
 
-func TestGetActiveKey_ReturnsHighestVersion(t *testing.T) {
-	db := setupPostgres(t)
-	store := postgres.NewStore(postgres.Config{})
-	ctx := context.Background()
-
-	_ = store.CreateKey(ctx, db, "s", "id", 1, []byte("v1"), "sk")
-	_ = store.CreateKey(ctx, db, "s", "id", 2, []byte("v2"), "sk")
-	_ = store.CreateKey(ctx, db, "s", "id", 3, []byte("v3"), "sk")
-
-	key, err := store.GetActiveKey(ctx, db, "s", "id")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if key.KeyVersion != 3 {
-		t.Fatalf("expected version 3, got %d", key.KeyVersion)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// RevokeKeys
-// ---------------------------------------------------------------------------
-
 func TestRevokeKeys_PreservesHighestVersion(t *testing.T) {
 	db := setupPostgres(t)
-	store := postgres.NewStore(postgres.Config{})
+	store, _ := setupTestStore(t)
 	ctx := context.Background()
 
-	_ = store.CreateKey(ctx, db, "s", "id", 1, []byte("v1"), "sk")
-	_ = store.CreateKey(ctx, db, "s", "id", 2, []byte("v2"), "sk")
-	_ = store.CreateKey(ctx, db, "s", "id", 3, []byte("v3"), "sk")
+	_, _ = store.CreateKey(ctx, db, "s", "id")
+	_, _ = store.RotateKey(ctx, db, "s", "id")
+	_, _ = store.RotateKey(ctx, db, "s", "id")
 
 	if err := store.RevokeKeys(ctx, db, "s", "id"); err != nil {
 		t.Fatalf("RevokeKeys: %v", err)
@@ -233,16 +274,15 @@ func TestRevokeKeys_PreservesHighestVersion(t *testing.T) {
 
 func TestRevokeKeys_SingleKeyNotRevoked(t *testing.T) {
 	db := setupPostgres(t)
-	store := postgres.NewStore(postgres.Config{})
+	store, _ := setupTestStore(t)
 	ctx := context.Background()
 
-	_ = store.CreateKey(ctx, db, "s", "only", 1, []byte("v1"), "sk")
+	_, _ = store.CreateKey(ctx, db, "s", "only")
 
 	if err := store.RevokeKeys(ctx, db, "s", "only"); err != nil {
 		t.Fatalf("RevokeKeys: %v", err)
 	}
 
-	// Single key should remain active — there's nothing older to revoke.
 	active, err := store.GetActiveKey(ctx, db, "s", "only")
 	if err != nil {
 		t.Fatalf("GetActiveKey: %v", err)
@@ -254,26 +294,21 @@ func TestRevokeKeys_SingleKeyNotRevoked(t *testing.T) {
 
 func TestRevokeKeys_NoKeysIsNoop(t *testing.T) {
 	db := setupPostgres(t)
-	store := postgres.NewStore(postgres.Config{})
+	store, _ := setupTestStore(t)
 	ctx := context.Background()
 
-	// Should not error even if there are no keys.
 	if err := store.RevokeKeys(ctx, db, "empty", "scope"); err != nil {
 		t.Fatalf("RevokeKeys on empty scope: %v", err)
 	}
 }
 
-// ---------------------------------------------------------------------------
-// DestroyKeys
-// ---------------------------------------------------------------------------
-
 func TestDestroyKeys(t *testing.T) {
 	db := setupPostgres(t)
-	store := postgres.NewStore(postgres.Config{})
+	store, _ := setupTestStore(t)
 	ctx := context.Background()
 
-	_ = store.CreateKey(ctx, db, "s", "id", 1, []byte("v1"), "sk")
-	_ = store.CreateKey(ctx, db, "s", "id", 2, []byte("v2"), "sk")
+	_, _ = store.CreateKey(ctx, db, "s", "id")
+	_, _ = store.RotateKey(ctx, db, "s", "id")
 
 	if err := store.DestroyKeys(ctx, db, "s", "id"); err != nil {
 		t.Fatalf("DestroyKeys: %v", err)
@@ -292,7 +327,7 @@ func TestDestroyKeys(t *testing.T) {
 
 func TestDestroyKeys_NoKeysIsNoop(t *testing.T) {
 	db := setupPostgres(t)
-	store := postgres.NewStore(postgres.Config{})
+	store, _ := setupTestStore(t)
 	ctx := context.Background()
 
 	if err := store.DestroyKeys(ctx, db, "empty", "scope"); err != nil {
@@ -300,29 +335,21 @@ func TestDestroyKeys_NoKeysIsNoop(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Scope isolation
-// ---------------------------------------------------------------------------
-
 func TestScopeIsolation(t *testing.T) {
 	db := setupPostgres(t)
-	store := postgres.NewStore(postgres.Config{})
+	store, _ := setupTestStore(t)
 	ctx := context.Background()
 
-	_ = store.CreateKey(ctx, db, "scope-a", "id-1", 1, []byte("a1"), "sk")
-	_ = store.CreateKey(ctx, db, "scope-b", "id-1", 1, []byte("b1"), "sk")
+	_, _ = store.CreateKey(ctx, db, "scope-a", "id-1")
+	_, _ = store.CreateKey(ctx, db, "scope-b", "id-1")
 
 	a, _ := store.GetActiveKey(ctx, db, "scope-a", "id-1")
 	b, _ := store.GetActiveKey(ctx, db, "scope-b", "id-1")
 
-	if string(a.EncryptedDEK) != "a1" {
-		t.Fatalf("scope-a DEK: %s", a.EncryptedDEK)
-	}
-	if string(b.EncryptedDEK) != "b1" {
-		t.Fatalf("scope-b DEK: %s", b.EncryptedDEK)
+	if a.Scope != "scope-a" || b.Scope != "scope-b" {
+		t.Fatalf("scopes mismatch: %s vs %s", a.Scope, b.Scope)
 	}
 
-	// Destroying scope-a should not affect scope-b.
 	_ = store.DestroyKeys(ctx, db, "scope-a", "id-1")
 	_, err := store.GetActiveKey(ctx, db, "scope-a", "id-1")
 	if !errors.Is(err, encryption.ErrKeyNotFound) {
@@ -337,13 +364,9 @@ func TestScopeIsolation(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Transaction participation
-// ---------------------------------------------------------------------------
-
 func TestWithTx_Commit(t *testing.T) {
 	db := setupPostgres(t)
-	store := postgres.NewStore(postgres.Config{})
+	store, _ := setupTestStore(t)
 	ctx := context.Background()
 
 	tx, err := db.Begin(ctx)
@@ -351,7 +374,7 @@ func TestWithTx_Commit(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := store.CreateKey(ctx, tx, "tx", "commit", 1, []byte("dek"), "sk"); err != nil {
+	if _, err := store.CreateKey(ctx, tx, "tx", "commit"); err != nil {
 		tx.Rollback(ctx)
 		t.Fatal(err)
 	}
@@ -359,7 +382,6 @@ func TestWithTx_Commit(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Key should be visible outside the transaction.
 	key, err := store.GetActiveKey(ctx, db, "tx", "commit")
 	if err != nil {
 		t.Fatalf("key should exist after commit: %v", err)
@@ -371,7 +393,7 @@ func TestWithTx_Commit(t *testing.T) {
 
 func TestWithTx_Rollback(t *testing.T) {
 	db := setupPostgres(t)
-	store := postgres.NewStore(postgres.Config{})
+	store, _ := setupTestStore(t)
 	ctx := context.Background()
 
 	tx, err := db.Begin(ctx)
@@ -379,7 +401,7 @@ func TestWithTx_Rollback(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_ = store.CreateKey(ctx, tx, "tx", "rollback", 1, []byte("dek"), "sk")
+	_, _ = store.CreateKey(ctx, tx, "tx", "rollback")
 	tx.Rollback(ctx)
 
 	_, err = store.GetActiveKey(ctx, db, "tx", "rollback")
@@ -390,29 +412,22 @@ func TestWithTx_Rollback(t *testing.T) {
 
 func TestWithTx_MultipleOperationsAtomic(t *testing.T) {
 	db := setupPostgres(t)
-	store := postgres.NewStore(postgres.Config{})
+	store, _ := setupTestStore(t)
 	ctx := context.Background()
 
-	// Create initial key outside tx.
-	_ = store.CreateKey(ctx, db, "tx", "atomic", 1, []byte("v1"), "sk")
+	_, _ = store.CreateKey(ctx, db, "tx", "atomic")
 
 	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	// Create v2 and revoke within same tx.
-	if err := store.CreateKey(ctx, tx, "tx", "atomic", 2, []byte("v2"), "sk"); err != nil {
-		tx.Rollback(ctx)
-		t.Fatal(err)
-	}
-	if err := store.RevokeKeys(ctx, tx, "tx", "atomic"); err != nil {
+	if _, err := store.RotateKey(ctx, tx, "tx", "atomic"); err != nil {
 		tx.Rollback(ctx)
 		t.Fatal(err)
 	}
 	tx.Rollback(ctx)
 
-	// After rollback, only v1 should exist and be active.
 	active, err := store.GetActiveKey(ctx, db, "tx", "atomic")
 	if err != nil {
 		t.Fatalf("GetActiveKey: %v", err)
@@ -422,15 +437,10 @@ func TestWithTx_MultipleOperationsAtomic(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Custom config
-// ---------------------------------------------------------------------------
-
 func TestCustomSchemaAndTable(t *testing.T) {
 	db := setupPostgres(t)
 	ctx := context.Background()
 
-	// Create custom schema and table.
 	if _, err := db.Exec(ctx, "CREATE SCHEMA IF NOT EXISTS custom_schema"); err != nil {
 		t.Fatal(err)
 	}
@@ -443,12 +453,16 @@ func TestCustomSchemaAndTable(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	store := postgres.NewStore(postgres.Config{
+	c := aesgcm.New()
+	sysKey := makeSystemKey(1)
+	keyring := systemkey.NewKeyring(map[string][]byte{"sys-key-1": sysKey}, "sys-key-1")
+	env := envelope.New(keyring, c)
+	store := postgres.NewStore(env, postgres.Config{
 		Schema: "custom_schema",
 		Table:  "custom_keys",
 	})
 
-	if err := store.CreateKey(ctx, db, "s", "id", 1, []byte("dek"), "sk"); err != nil {
+	if _, err := store.CreateKey(ctx, db, "s", "id"); err != nil {
 		t.Fatalf("CreateKey with custom schema/table: %v", err)
 	}
 
@@ -461,29 +475,25 @@ func TestCustomSchemaAndTable(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Duplicate key version (PK constraint)
-// ---------------------------------------------------------------------------
-
-func TestCreateKey_DuplicateVersionFails(t *testing.T) {
+func TestCreateKey_AlreadyExists(t *testing.T) {
 	db := setupPostgres(t)
-	store := postgres.NewStore(postgres.Config{})
+	store, _ := setupTestStore(t)
 	ctx := context.Background()
 
-	_ = store.CreateKey(ctx, db, "s", "id", 1, []byte("dek"), "sk")
-	err := store.CreateKey(ctx, db, "s", "id", 1, []byte("dek2"), "sk")
-	if err == nil {
-		t.Fatal("expected error for duplicate key version")
+	_, err := store.CreateKey(ctx, db, "s", "id")
+	if err != nil {
+		t.Fatalf("first CreateKey: %v", err)
+	}
+
+	_, err = store.CreateKey(ctx, db, "s", "id")
+	if !errors.Is(err, encryption.ErrKeyExists) {
+		t.Fatalf("expected ErrKeyExists on duplicate CreateKey, got %v", err)
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Concurrent access
-// ---------------------------------------------------------------------------
-
 func TestConcurrentCreateDifferentScopes(t *testing.T) {
 	db := setupPostgres(t)
-	store := postgres.NewStore(postgres.Config{})
+	store, _ := setupTestStore(t)
 	ctx := context.Background()
 
 	const n = 20
@@ -495,7 +505,7 @@ func TestConcurrentCreateDifferentScopes(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			scopeID := fmt.Sprintf("concurrent-%d", i)
-			errs[i] = store.CreateKey(ctx, db, "conc", scopeID, 1, []byte("dek"), "sk")
+			_, errs[i] = store.CreateKey(ctx, db, "conc", scopeID)
 		}(i)
 	}
 	wg.Wait()
@@ -506,7 +516,6 @@ func TestConcurrentCreateDifferentScopes(t *testing.T) {
 		}
 	}
 
-	// Verify all keys exist.
 	for i := 0; i < n; i++ {
 		scopeID := fmt.Sprintf("concurrent-%d", i)
 		if _, err := store.GetActiveKey(ctx, db, "conc", scopeID); err != nil {
@@ -515,17 +524,12 @@ func TestConcurrentCreateDifferentScopes(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Migration idempotency
-// ---------------------------------------------------------------------------
-
 func TestMigrationIdempotent(t *testing.T) {
 	db := setupPostgres(t)
 	ctx := context.Background()
 
 	migration, _ := migrations.FS.ReadFile("001_encryption_keys.sql")
 
-	// Apply migration a second time — should not fail due to IF NOT EXISTS.
 	if _, err := db.Exec(ctx, string(migration)); err != nil {
 		t.Fatalf("re-applying migration should be idempotent: %v", err)
 	}
@@ -533,7 +537,7 @@ func TestMigrationIdempotent(t *testing.T) {
 
 func TestRewrapSystemKeys_RewrapsMatchingRows(t *testing.T) {
 	db := setupPostgres(t)
-	store := postgres.NewStore(postgres.Config{})
+	store, _ := setupTestStore(t)
 	ctx := context.Background()
 	c := aesgcm.New()
 
@@ -549,13 +553,13 @@ func TestRewrapSystemKeys_RewrapsMatchingRows(t *testing.T) {
 	piiDEK := []byte("fedcba9876543210fedcba9876543210")
 	alreadyNewDEK := []byte("00112233445566778899aabbccddeeff")
 
-	mustStoreEncryptedKey(t, store, ctx, db, c, oldKey, "old", "secret", "stripe", 1, oldRevokedDEK)
-	mustStoreEncryptedKey(t, store, ctx, db, c, oldKey, "old", "secret", "stripe", 2, oldActiveDEK)
+	mustStoreRawEncryptedKey(t, ctx, db, c, oldKey, "old", "secret", "stripe", 1, oldRevokedDEK)
+	mustStoreRawEncryptedKey(t, ctx, db, c, oldKey, "old", "secret", "stripe", 2, oldActiveDEK)
 	if err := store.RevokeKeys(ctx, db, "secret", "stripe"); err != nil {
 		t.Fatalf("RevokeKeys: %v", err)
 	}
-	mustStoreEncryptedKey(t, store, ctx, db, c, oldKey, "old", "pii", "user-1", 1, piiDEK)
-	mustStoreEncryptedKey(t, store, ctx, db, c, newKey, "new", "secret", "already-new", 1, alreadyNewDEK)
+	mustStoreRawEncryptedKey(t, ctx, db, c, oldKey, "old", "pii", "user-1", 1, piiDEK)
+	mustStoreRawEncryptedKey(t, ctx, db, c, newKey, "new", "secret", "already-new", 1, alreadyNewDEK)
 
 	unchangedBefore, err := store.GetKey(ctx, db, "secret", "already-new", 1)
 	if err != nil {
@@ -636,7 +640,7 @@ func TestRewrapSystemKeys_RewrapsMatchingRows(t *testing.T) {
 
 func TestRewrapSystemKeys_DryRun(t *testing.T) {
 	db := setupPostgres(t)
-	store := postgres.NewStore(postgres.Config{})
+	store, _ := setupTestStore(t)
 	ctx := context.Background()
 	c := aesgcm.New()
 
@@ -648,7 +652,7 @@ func TestRewrapSystemKeys_DryRun(t *testing.T) {
 	}, "new")
 
 	dek := []byte("11223344556677889900aabbccddeeff")
-	mustStoreEncryptedKey(t, store, ctx, db, c, oldKey, "old", "secret", "dry-run", 1, dek)
+	mustStoreRawEncryptedKey(t, ctx, db, c, oldKey, "old", "secret", "dry-run", 1, dek)
 
 	before, err := store.GetKey(ctx, db, "secret", "dry-run", 1)
 	if err != nil {
@@ -690,7 +694,6 @@ func TestRewrapSystemKeys_DryRun(t *testing.T) {
 
 func TestRewrapSystemKeys_Idempotent(t *testing.T) {
 	db := setupPostgres(t)
-	store := postgres.NewStore(postgres.Config{})
 	ctx := context.Background()
 	c := aesgcm.New()
 
@@ -702,7 +705,7 @@ func TestRewrapSystemKeys_Idempotent(t *testing.T) {
 	}, "new")
 
 	dek := []byte("ffeeddccbbaa00998877665544332211")
-	mustStoreEncryptedKey(t, store, ctx, db, c, oldKey, "old", "secret", "idempotent", 1, dek)
+	mustStoreRawEncryptedKey(t, ctx, db, c, oldKey, "old", "secret", "idempotent", 1, dek)
 
 	first, err := postgres.RewrapSystemKeys(ctx, db, postgres.Config{}, keyring, c, postgres.RewrapSystemKeysOptions{
 		FromSystemKeyID: "old",
@@ -738,7 +741,7 @@ func TestRewrapSystemKeys_Idempotent(t *testing.T) {
 
 func TestRewrapSystemKeys_ConcurrentRuns(t *testing.T) {
 	db := setupPostgres(t)
-	store := postgres.NewStore(postgres.Config{})
+	store, _ := setupTestStore(t)
 	ctx := context.Background()
 	c := aesgcm.New()
 
@@ -752,7 +755,7 @@ func TestRewrapSystemKeys_ConcurrentRuns(t *testing.T) {
 	for i := 0; i < 10; i++ {
 		scopeID := fmt.Sprintf("concurrent-%d", i)
 		dek := []byte(fmt.Sprintf("%032d", i))
-		mustStoreEncryptedKey(t, store, ctx, db, c, oldKey, "old", "secret", scopeID, 1, dek)
+		mustStoreRawEncryptedKey(t, ctx, db, c, oldKey, "old", "secret", scopeID, 1, dek)
 	}
 
 	results := make([]postgres.RewrapSystemKeysResult, 2)
@@ -797,7 +800,7 @@ func TestRewrapSystemKeys_ConcurrentRuns(t *testing.T) {
 
 func TestRewrapSystemKeys_HistoricalCiphertextsRemainDecryptable(t *testing.T) {
 	db := setupPostgres(t)
-	store := postgres.NewStore(postgres.Config{})
+	store, _ := setupTestStore(t)
 	ctx := context.Background()
 	c := aesgcm.New()
 
@@ -814,7 +817,7 @@ func TestRewrapSystemKeys_HistoricalCiphertextsRemainDecryptable(t *testing.T) {
 		"new": newKey,
 	}, "new")
 
-	mustStoreEncryptedKey(t, store, ctx, db, c, oldKey, "old", "secret", "history", 1, []byte("11111111111111111111111111111111"))
+	mustStoreRawEncryptedKey(t, ctx, db, c, oldKey, "old", "secret", "history", 1, []byte("11111111111111111111111111111111"))
 	oldEnv := envelope.New(oldOnly, c)
 
 	keyV1Before, err := store.GetActiveKey(ctx, db, "secret", "history")
@@ -826,7 +829,7 @@ func TestRewrapSystemKeys_HistoricalCiphertextsRemainDecryptable(t *testing.T) {
 		t.Fatalf("Encrypt v1: %v", err)
 	}
 
-	mustStoreEncryptedKey(t, store, ctx, db, c, oldKey, "old", "secret", "history", 2, []byte("22222222222222222222222222222222"))
+	mustStoreRawEncryptedKey(t, ctx, db, c, oldKey, "old", "secret", "history", 2, []byte("22222222222222222222222222222222"))
 	if err := store.RevokeKeys(ctx, db, "secret", "history"); err != nil {
 		t.Fatalf("RevokeKeys: %v", err)
 	}

@@ -15,8 +15,8 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/eventsalsa/encryption/keystore/postgres"
-	"github.com/eventsalsa/encryption/keystore/postgres/migrations"
+	"github.com/eventsalsa/encryption/postgres"
+	"github.com/eventsalsa/encryption/postgres/migrations"
 )
 
 func main() {

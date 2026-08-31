@@ -4,8 +4,8 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/eventsalsa/encryption"
 	"github.com/eventsalsa/encryption/cipher"
-	encryption "github.com/eventsalsa/encryption/encerr"
 	"github.com/eventsalsa/encryption/systemkey"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"

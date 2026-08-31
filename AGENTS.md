@@ -57,38 +57,21 @@ This repository provides an envelope encryption library for event-sourced system
 
 | Directory | Package | Role / Description |
 |-----------|---------|--------------------|
-| [encerr/](encerr) | `encerr` | Sentinel errors and memory zeroing utilities to prevent import cycles. |
-| [cipher/](cipher) | `cipher` | Pluggable symmetric encryption interface and implementations (default: AES-256-GCM). |
-| [systemkey/](systemkey) | `systemkey` | KEK (Key Encrypting Key) management abstractions. |
-| [keystore/](keystore) | `keystore` | Persistent encrypted storage abstractions for DEKs (Data Encrypting Keys). |
-| [keystore/postgres/](keystore/postgres) | `postgres` | Stateless PostgreSQL repository implementing DEK persistence with explicit `pgxConn`. |
-| [keymanager/](keymanager) | `keymanager` | Core orchestration for key creation, rotation, and shredding. |
-| [envelope/](envelope) | `envelope` | Pure in-memory envelope encryption engine (DEK wrapping & data encrypt/decrypt). |
-| [hash/](hash) | `hash` | Deterministic hashing (HMAC-SHA256) for uniqueness assertions. |
-| [encryption.go](encryption.go) | `encryption` | Main library entrypoint and package constructors. |
+| [errors.go](errors.go) / [zerobytes.go](zerobytes.go) | `encryption` | Root package defining sentinel errors (`ErrKeyNotFound`, etc.) and memory zeroing utilities. |
+| [cipher/](cipher) | `cipher` | Pluggable symmetric encryption interface and implementations (default: `cipher/aesgcm` AES-256-GCM). |
+| [systemkey/](systemkey) | `systemkey` | KEK (Key Encrypting Key) management abstractions and filesystem loaders. |
+| [envelope/](envelope) | `envelope` | Pure in-memory envelope encryption engine (DEK wrapping/unwrapping & data encrypt/decrypt). |
+| [postgres/](postgres) | `postgres` | Stateless PostgreSQL keystore and key lifecycle management (`CreateKey`, `RotateKey`, `GetActiveKey`, `GetKey`, `RevokeKeys`, `DestroyKeys`, `RewrapSystemKeys`). |
+| [postgres/migrations/](postgres/migrations) | `migrations` | Embedded PostgreSQL migration SQL and migration generator. |
+| [hash/](hash) | `hash` | Deterministic blind indexing (HMAC-SHA256). |
 
 ---
 
 ## 4. Key Coding Conventions
 
-- **Circular Dependencies**: Avoid circular imports. Shared error sentinels and byte zeroing utilities live in [encerr/](encerr). Internal packages must import `encerr` directly. The root `encryption` package re-exports these public symbols for consumers.
-- **Interfaces**: Code to interfaces (e.g., `Cipher`, `KeyStore`, `Keyring`, `PgxConn`). Concrete implementations reside in sub-packages (e.g., `cipher/aesgcm/`, `keystore/postgres/`).
-- **Decoupled Crypto**: `envelope.Envelope` is a pure in-memory engine with zero storage or context dependencies.
-- **Stateless Storage**: `postgres.Store` is stateless configuration only; all operations accept `conn pgxConn` directly (`*pgxpool.Pool`, `pgx.Tx`, `*pgx.Conn`).
-- **Memory Hygiene**: Always scrub plaintext keys (DEKs) from memory when finished. Defer `encryption.ZeroBytes` or `encerr.ZeroBytes` immediately after instantiation.
+- **Acyclic Dependencies**: The root `encryption` package has zero internal imports and defines sentinel errors and `ZeroBytes`. Internal packages import `encryption` directly.
+- **Decoupled In-Memory Crypto**: `envelope.Envelope` is a pure in-memory engine with zero storage or context dependencies.
+- **Stateless Storage**: `postgres.Store` is stateless configuration only; all operations accept an unexported `conn pgxConn` interface satisfied by `*pgxpool.Pool`, `pgx.Tx`, and `*pgx.Conn`.
+- **Memory Hygiene**: Always scrub plaintext keys (DEKs) from memory when finished. Defer `encryption.ZeroBytes` immediately after generation or unwrapping.
 - **Scope Namespacing**: Keys are grouped by namespaces using `(scope, scopeID)` tuples to partition encryption scopes.
 
----
-
-## 5. Specialized Skills
-
-For specialized development workflows, reference and utilize the custom skills configured within this repository:
-
-1. **DevOps & Workflows**: [go-devops](.agents/skills/go-devops/SKILL.md)
-   - Configuration of GitHub Actions, golangci-lint, and dependency rules.
-2. **Cryptographic Standards**: [secure-cryptography](.agents/skills/secure-cryptography/SKILL.md)
-   - Nonce safety, key isolation rules, base64 layouts, and side-channel safety.
-3. **Test Engineering**: [go-testing](.agents/skills/go-testing/SKILL.md)
-   - Table-driven unit tests, memory verification patterns, and Docker-based PostgreSQL integration tests.
-
-For command execution optimizations and token budget guidelines, see [antigravity-rtk-rules.md](.agents/rules/antigravity-rtk-rules.md).

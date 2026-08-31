@@ -1,71 +1,69 @@
-# Refactor: Decouple Envelope Crypto Engine & Stateless Keystore
+# Walkthrough: Pure In-Memory Envelope Crypto & Consolidated Postgres Keystore
 
 ## Summary
 
-This refactor decouples envelope encryption from persistent storage and converts `keystore/postgres` into a stateless adapter.
-
-Key architectural improvements:
-1. **Decoupled Crypto Engine (`envelope.Envelope`)**: Pure in-memory cryptographic transformations (`Encrypt`, `Decrypt`, `WrapDEK`, `UnwrapDEK`, `GenerateDEK`, `ActiveKeyID`) with zero storage or context dependencies.
-2. **Stateless `postgres.Store`**: Holds only configuration (`Config`). All CRUD operations (`CreateKey`, `GetActiveKey`, `GetKey`, `RevokeKeys`, `DestroyKeys`) take an explicit `conn postgres.PgxConn` parameter (`*pgxpool.Pool`, `pgx.Tx`, `*pgx.Conn`).
-3. **Clean Dependency Injection & First-Class Transactions**: Eliminates the stateful fallback mechanism (`*pgxpool.Pool` embedded in store) and context pollution (`keystore.WithTx` / `keystore.context.go`). Consumers can inject standard singleton stores into their DI graphs and pass transactions directly into method invocations.
-4. **Standalone Admin Function (`postgres.RewrapSystemKeys`)**: Decoupled from `Store` instance methods into a standalone administrative migration function operating on `*pgxpool.Pool`.
-5. **Removed Obsolete Domain Fluff**: Removed `pii` and `secret` domain wrapper packages in favor of pure envelope primitives and `keymanager` operations.
+This refactor establishes an **idealistic, pure, and cohesive architecture** for `eventsalsa/encryption`:
+1. **Consolidated PostgreSQL Keystore (`postgres`)**:
+   - Merged `keystore/postgres` and `keymanager` into a single, cohesive `postgres.Store`.
+   - DEK generation, wrapping with KEK, and SQL persistence are handled in unified methods (`CreateKey`, `RotateKey`, `GetActiveKey`, `GetKey`, `RevokeKeys`, `DestroyKeys`, `ActiveKeyVersion`).
+   - The database executor interface `pgxConn` is **strictly unexported** (`type pgxConn interface`). It never leaks into the public API. Callers pass standard `*pgxpool.Pool`, `pgx.Tx`, or `*pgx.Conn` directly.
+2. **Pure In-Memory Cryptographic Engine (`envelope`)**:
+   - `envelope.Envelope` has **zero database, transaction, or context dependencies**.
+   - Handles in-memory DEK generation, wrapping/unwrapping, and data encryption/decryption (`Encrypt`, `Decrypt`, `WrapDEK`, `UnwrapDEK`, `GenerateDEK`, `ActiveKeyID`).
+3. **Pure Root Package & Eliminated `encerr`**:
+   - Root package `encryption` defines sentinel errors (`ErrKeyNotFound`, etc.) and memory hygiene utilities (`ZeroBytes`).
+   - Has **zero internal imports**, naturally eliminating circular dependencies without needing a separate `encerr/` package.
+4. **Eliminated `Module` Monolith**:
+   - Removed `encryption.Module` in favor of standard idiomatic Go constructor injection (`envelope.New(...)`, `postgres.NewStore(...)`).
+5. **Deleted Redundant Directories**:
+   - Permanently deleted `keystore/`, `keymanager/`, `encerr/`, `.agents/skills/`, and `.agents/rules/`.
 
 ---
 
-## Changes
+## Clean Architecture (7 Acyclic Packages)
 
-### 1. `envelope` Package
-- Replaced `envelope.Encryptor` with `envelope.Envelope`.
-- Removed database dependencies and context from `Encrypt` and `Decrypt`.
-- Signatures:
-  - `Encrypt(sysKeyID string, encDEK []byte, plaintext string) (string, error)`
-  - `Decrypt(sysKeyID string, encDEK []byte, ciphertext string) (string, error)`
-  - `WrapDEK(sysKeyID string, dek []byte) ([]byte, error)`
-  - `UnwrapDEK(sysKeyID string, encDEK []byte) ([]byte, error)`
-  - `GenerateDEK() ([]byte, error)`
-  - `ActiveKeyID() string`
+```mermaid
+flowchart TD
+    ROOT["encryption (Root Package: Sentinel Errors & ZeroBytes)"]
+    CIPHER["cipher (Cipher Interface)"]
+    AESGCM["cipher/aesgcm (AES-256-GCM)"]
+    SYSKEY["systemkey (Keyring)"]
+    HASH["hash (HMAC-SHA256)"]
+    ENV["envelope (Pure In-Memory Crypto Engine)"]
+    PG["postgres (Store, Rewrap, Migrations)"]
 
-### 2. `keystore/postgres` Package
-- Removed `db *pgxpool.Pool` and `extractor TxExtractor` from `Store`.
-- Added `PgxConn` interface satisfied by `*pgxpool.Pool`, `pgx.Tx`, and `*pgx.Conn`.
-- Updated all store CRUD methods to accept `conn PgxConn`.
-- Converted `RewrapSystemKeys` to standalone admin function:
-  `RewrapSystemKeys(ctx, pool, cfg, keyring, cipher, opts)`.
-- Deleted `keystore/context.go` and `keystore/context_test.go`.
-
-### 3. `keymanager` Package
-- `Manager` now holds `store KeyStore` and `env *envelope.Envelope`.
-- All methods accept `conn postgres.PgxConn` and coordinate DEK generation/wrapping via `env`.
-
-### 4. Domain Packages
-- Deleted `pii/` and `secret/` packages.
-
-### 5. Documentation & Examples
-- Updated `encryption.go` composition root.
-- Updated `examples/basic`, `examples/pii`, and `examples/secrets`.
-- Updated `README.md`, `doc.go`, and `AGENTS.md`.
+    ROOT --> CIPHER
+    ROOT --> SYSKEY
+    CIPHER & ROOT --> AESGCM
+    ROOT & CIPHER & SYSKEY --> ENV
+    ROOT & CIPHER & SYSKEY & ENV --> PG
+```
 
 ---
 
 ## Verification Results
 
-### Unit Tests
+### 1. Unit Tests
 ```bash
 go test -race ./...
 ```
 All unit tests pass with zero race conditions.
 
-### Integration Tests
+### 2. Integration Tests (PostgreSQL via Testcontainers)
 ```bash
-go test -race -tags=integration ./keystore/postgres/...
+go test -race -tags=integration -v ./postgres/...
 ```
-All 13 testcontainers PostgreSQL integration tests pass (CRUD, concurrency, idempotency, isolation, transaction rollback/commit, rewrapping).
+All 13 integration test suites passed (CRUD, key rotation, scope isolation, transaction rollback/commit, migration idempotency, concurrent creation, dry-run and live system-key rewrapping).
 
-### Linter & Security
+### 3. Code Quality & Linters
 ```bash
-golangci-lint run --timeout=5m
+gofmt -s -w .
 go vet ./...
-gosec ./...
+golangci-lint run --timeout=5m
 ```
 Passed with 0 issues.
+
+### 4. Runnable Examples
+- `go run ./examples/basic/main.go` — Verified in-memory envelope crypto workflow.
+- `go run ./examples/pii/main.go` — Verified GDPR crypto-shredding.
+- `go run ./examples/secrets/main.go` — Verified zero-downtime key rotation.

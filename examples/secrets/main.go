@@ -1,78 +1,82 @@
-// Example: secret encryption with key rotation.
+// Example: secret encryption with key rotation workflow.
 package main
 
 import (
-	"context"
 	"fmt"
-	"log"
+	"os"
 
 	"github.com/eventsalsa/encryption"
+	"github.com/eventsalsa/encryption/cipher/aesgcm"
+	"github.com/eventsalsa/encryption/envelope"
 	"github.com/eventsalsa/encryption/testutil"
-
-	_ "github.com/eventsalsa/encryption/cipher/aesgcm"
 )
 
 func main() {
-	ctx := context.Background()
+	if err := run(); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+}
 
+func run() error {
+	// 1. Initialize envelope crypto engine.
 	keyring := testutil.NewTestKeyring()
-	store := testutil.NewInMemoryKeyStore()
+	c := aesgcm.New()
+	env := envelope.New(keyring, c)
 
-	mod := encryption.New(encryption.Config{
-		Keyring: keyring,
-		Store:   store,
-	})
+	sysKeyID := env.ActiveKeyID()
 
-	scope, secretID := "api_token", "service-A"
+	// 2. Generate and wrap DEK v1.
+	dek1, err := env.GenerateDEK()
+	if err != nil {
+		return fmt.Errorf("generate DEK v1: %w", err)
+	}
+	defer encryption.ZeroBytes(dek1)
 
-	// 1. Create initial key (version 1).
-	v1, err := mod.KeyManager.CreateKey(ctx, nil, scope, secretID)
+	encDEK1, err := env.WrapDEK(sysKeyID, dek1)
 	if err != nil {
-		log.Fatal("CreateKey: ", err)
-	}
-	fmt.Printf("Created key version %d\n", v1)
-
-	// 2. Fetch key v1 and encrypt secret.
-	keyV1, err := store.GetActiveKey(ctx, nil, scope, secretID)
-	if err != nil {
-		log.Fatal("GetActiveKey: ", err)
-	}
-	secret1, err := mod.Envelope.Encrypt(keyV1.SystemKeyID, keyV1.EncryptedDEK, "s3cr3t-token-v1")
-	if err != nil {
-		log.Fatal("Encrypt v1: ", err)
-	}
-	fmt.Printf("Secret 1 (key v%d): %s\n", keyV1.KeyVersion, secret1)
-
-	// --- 3. Rotate the key ---
-	v2, err := mod.KeyManager.RotateKey(ctx, nil, scope, secretID)
-	if err != nil {
-		log.Fatal("RotateKey: ", err)
-	}
-	fmt.Printf("\nRotated to key version %d\n", v2)
-
-	// 4. Fetch new active key v2 and encrypt new secret.
-	keyV2, err := store.GetActiveKey(ctx, nil, scope, secretID)
-	if err != nil {
-		log.Fatal("GetActiveKey: ", err)
-	}
-	secret2, err := mod.Envelope.Encrypt(keyV2.SystemKeyID, keyV2.EncryptedDEK, "s3cr3t-token-v2")
-	if err != nil {
-		log.Fatal("Encrypt v2: ", err)
-	}
-	fmt.Printf("Secret 2 (key v%d): %s\n", keyV2.KeyVersion, secret2)
-
-	// 5. Decrypt both historical and new secrets using their respective key versions.
-	plain1, err := mod.Envelope.Decrypt(keyV1.SystemKeyID, keyV1.EncryptedDEK, secret1)
-	if err != nil {
-		log.Fatal("Decrypt secret1: ", err)
-	}
-	plain2, err := mod.Envelope.Decrypt(keyV2.SystemKeyID, keyV2.EncryptedDEK, secret2)
-	if err != nil {
-		log.Fatal("Decrypt secret2: ", err)
+		return fmt.Errorf("wrap DEK v1: %w", err)
 	}
 
-	fmt.Printf("\nDecrypted secret 1 (key v%d): %s\n", keyV1.KeyVersion, plain1)
-	fmt.Printf("Decrypted secret 2 (key v%d): %s\n", keyV2.KeyVersion, plain2)
+	secret1 := "production-api-token-2026-q1"
+	ciphertext1, err := env.Encrypt(sysKeyID, encDEK1, secret1)
+	if err != nil {
+		return fmt.Errorf("encrypt v1: %w", err)
+	}
+	fmt.Printf("Key v1 Encrypted Secret: %s\n", ciphertext1)
 
+	// 3. Key Rotation: Generate and wrap DEK v2.
+	// In production, call: store.RotateKey(ctx, conn, "api_token", "stripe")
+	dek2, err := env.GenerateDEK()
+	if err != nil {
+		return fmt.Errorf("generate DEK v2: %w", err)
+	}
+	defer encryption.ZeroBytes(dek2)
+
+	encDEK2, err := env.WrapDEK(sysKeyID, dek2)
+	if err != nil {
+		return fmt.Errorf("wrap DEK v2: %w", err)
+	}
+
+	secret2 := "production-api-token-2026-q2"
+	ciphertext2, err := env.Encrypt(sysKeyID, encDEK2, secret2)
+	if err != nil {
+		return fmt.Errorf("encrypt v2: %w", err)
+	}
+	fmt.Printf("Key v2 Encrypted Secret: %s\n", ciphertext2)
+
+	// 4. Decrypt both historical (v1) and active (v2) secrets.
+	decrypted1, err := env.Decrypt(sysKeyID, encDEK1, ciphertext1)
+	if err != nil {
+		return fmt.Errorf("decrypt v1: %w", err)
+	}
+	decrypted2, err := env.Decrypt(sysKeyID, encDEK2, ciphertext2)
+	if err != nil {
+		return fmt.Errorf("decrypt v2: %w", err)
+	}
+
+	fmt.Printf("\nDecrypted v1: %s\n", decrypted1)
+	fmt.Printf("Decrypted v2: %s\n", decrypted2)
 	fmt.Println("\n✓ Both old and new secrets decrypt correctly after rotation.")
+	return nil
 }
