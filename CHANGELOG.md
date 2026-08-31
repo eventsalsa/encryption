@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.0.5](https://github.com/eventsalsa/encryption/compare/v0.0.4...v0.0.5) (2026-08-31)
+
+
+### ⚠ BREAKING CHANGES
+
+* pure in-memory envelope crypto and consolidated postgres keystore ([#10](https://github.com/eventsalsa/encryption/issues/10))
+
+### Refactoring
+
+* pure in-memory envelope crypto and consolidated postgres keystore ([#10](https://github.com/eventsalsa/encryption/issues/10)) ([a56398e](https://github.com/eventsalsa/encryption/commit/a56398ee5a91d907e3b3a6f38d9ba6406f12f2e0))
+
 ## v0.0.4 - 2026-06-07
 
 ### Added
