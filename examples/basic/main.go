@@ -1,50 +1,58 @@
-// Example: basic envelope encryption with the encryption module.
+// Example: in-memory envelope encryption with envelope.Envelope.
 package main
 
 import (
-	"context"
 	"fmt"
-	"log"
+	"os"
 
 	"github.com/eventsalsa/encryption"
+	"github.com/eventsalsa/encryption/cipher/aesgcm"
+	"github.com/eventsalsa/encryption/envelope"
 	"github.com/eventsalsa/encryption/testutil"
-
-	_ "github.com/eventsalsa/encryption/cipher/aesgcm"
 )
 
 func main() {
-	ctx := context.Background()
+	if err := run(); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+}
 
-	// Set up an in-memory keyring and key store (for testing/demo only).
+func run() error {
+	// 1. Set up system keyring and symmetric cipher.
 	keyring := testutil.NewTestKeyring()
-	store := testutil.NewInMemoryKeyStore()
+	c := aesgcm.New()
 
-	// Create the encryption module (uses AES-256-GCM by default).
-	mod := encryption.New(encryption.Config{
-		Keyring: keyring,
-		Store:   store,
-	})
+	// 2. Initialize in-memory envelope engine.
+	env := envelope.New(keyring, c)
 
-	// Create a DEK for scope "user" / scopeID "42".
-	scope, scopeID := "user", "42"
-	version, err := mod.KeyManager.CreateKey(ctx, scope, scopeID)
+	// 3. Generate a fresh DEK in-memory and wrap it with the active system key.
+	dek, err := env.GenerateDEK()
 	if err != nil {
-		log.Fatal("CreateKey: ", err)
+		return fmt.Errorf("generate DEK: %w", err)
 	}
-	fmt.Printf("Created key version %d for %s:%s\n", version, scope, scopeID)
+	defer encryption.ZeroBytes(dek)
 
-	// Encrypt a plaintext string.
+	sysKeyID := env.ActiveKeyID()
+	encDEK, err := env.WrapDEK(sysKeyID, dek)
+	if err != nil {
+		return fmt.Errorf("wrap DEK: %w", err)
+	}
+	fmt.Printf("Generated DEK (%d bytes) wrapped with system key %q\n", len(dek), sysKeyID)
+
+	// 4. Encrypt plaintext using the wrapped DEK.
 	plaintext := "Hello, envelope encryption!"
-	ciphertext, keyVer, err := mod.Envelope.Encrypt(ctx, scope, scopeID, plaintext)
+	ciphertext, err := env.Encrypt(sysKeyID, encDEK, plaintext)
 	if err != nil {
-		log.Fatal("Encrypt: ", err)
+		return fmt.Errorf("encrypt: %w", err)
 	}
-	fmt.Printf("Encrypted (key v%d): %s\n", keyVer, ciphertext)
+	fmt.Printf("Encrypted ciphertext: %s\n", ciphertext)
 
-	// Decrypt it back.
-	decrypted, err := mod.Envelope.Decrypt(ctx, scope, scopeID, ciphertext, keyVer)
+	// 5. Decrypt ciphertext back to plaintext.
+	decrypted, err := env.Decrypt(sysKeyID, encDEK, ciphertext)
 	if err != nil {
-		log.Fatal("Decrypt: ", err)
+		return fmt.Errorf("decrypt: %w", err)
 	}
-	fmt.Printf("Decrypted: %s\n", decrypted)
+	fmt.Printf("Decrypted plaintext:  %s\n", decrypted)
+	return nil
 }

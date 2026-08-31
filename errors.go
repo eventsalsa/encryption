@@ -1,17 +1,17 @@
-// Package encryption provides envelope encryption for event-sourced systems.
+// Package encryption provides envelope encryption for Go systems.
 //
 // This package defines shared sentinel errors used across all sub-packages.
 package encryption
 
-import "github.com/eventsalsa/encryption/encerr"
+import "errors"
 
-// Sentinel errors re-exported from encerr for public use.
+// Sentinel errors used across the encryption library.
 var (
-	ErrKeyNotFound    = encerr.ErrKeyNotFound
-	ErrKeyExists      = encerr.ErrKeyExists
-	ErrEncryption     = encerr.ErrEncryption
-	ErrDecryption     = encerr.ErrDecryption
-	ErrInvalidKeySize = encerr.ErrInvalidKeySize
-	ErrKeyRevoked     = encerr.ErrKeyRevoked
-	ErrKeyDestroyed   = encerr.ErrKeyDestroyed
+	ErrKeyNotFound    = errors.New("encryption key not found")
+	ErrKeyExists      = errors.New("encryption key already exists")
+	ErrEncryption     = errors.New("encryption failed")
+	ErrDecryption     = errors.New("decryption failed")
+	ErrInvalidKeySize = errors.New("invalid key size")
+	ErrKeyRevoked     = errors.New("encryption key has been revoked")
+	ErrKeyDestroyed   = errors.New("encryption key has been destroyed")
 )

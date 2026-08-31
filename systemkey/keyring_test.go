@@ -5,7 +5,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/eventsalsa/encryption/encerr"
+	"github.com/eventsalsa/encryption"
 )
 
 func TestActiveKey(t *testing.T) {
@@ -45,7 +45,7 @@ func TestKey(t *testing.T) {
 		{
 			name:    "missing key",
 			keyID:   "k3",
-			wantErr: encerr.ErrKeyNotFound,
+			wantErr: encryption.ErrKeyNotFound,
 		},
 	}
 

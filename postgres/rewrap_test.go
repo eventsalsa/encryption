@@ -7,12 +7,13 @@ import (
 
 	"github.com/eventsalsa/encryption/cipher"
 	"github.com/eventsalsa/encryption/cipher/aesgcm"
-	"github.com/eventsalsa/encryption/keystore/postgres"
+	"github.com/eventsalsa/encryption/postgres"
 	"github.com/eventsalsa/encryption/systemkey"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 func TestRewrapSystemKeys_ValidatesOptions(t *testing.T) {
-	store := postgres.NewStore(postgres.Config{}, nil)
+	dummyPool := &pgxpool.Pool{}
 	validKeyring := systemkey.NewKeyring(map[string][]byte{
 		"old": makeSystemKey(1),
 		"new": makeSystemKey(2),
@@ -21,25 +22,37 @@ func TestRewrapSystemKeys_ValidatesOptions(t *testing.T) {
 
 	tests := []struct {
 		name    string
+		pool    *pgxpool.Pool
 		keyring systemkey.Keyring
 		cipher  cipher.Cipher
 		opts    postgres.RewrapSystemKeysOptions
 		wantErr string
 	}{
 		{
+			name:    "nil pool",
+			pool:    nil,
+			keyring: validKeyring,
+			cipher:  validCipher,
+			opts:    postgres.RewrapSystemKeysOptions{FromSystemKeyID: "old", ToSystemKeyID: "new"},
+			wantErr: "pool is nil",
+		},
+		{
 			name:    "nil keyring",
+			pool:    dummyPool,
 			cipher:  validCipher,
 			opts:    postgres.RewrapSystemKeysOptions{FromSystemKeyID: "old", ToSystemKeyID: "new"},
 			wantErr: "keyring is nil",
 		},
 		{
 			name:    "nil cipher",
+			pool:    dummyPool,
 			keyring: validKeyring,
 			opts:    postgres.RewrapSystemKeysOptions{FromSystemKeyID: "old", ToSystemKeyID: "new"},
 			wantErr: "cipher is nil",
 		},
 		{
 			name:    "missing source key",
+			pool:    dummyPool,
 			keyring: validKeyring,
 			cipher:  validCipher,
 			opts:    postgres.RewrapSystemKeysOptions{ToSystemKeyID: "new"},
@@ -47,6 +60,7 @@ func TestRewrapSystemKeys_ValidatesOptions(t *testing.T) {
 		},
 		{
 			name:    "missing target key",
+			pool:    dummyPool,
 			keyring: validKeyring,
 			cipher:  validCipher,
 			opts:    postgres.RewrapSystemKeysOptions{FromSystemKeyID: "old"},
@@ -54,6 +68,7 @@ func TestRewrapSystemKeys_ValidatesOptions(t *testing.T) {
 		},
 		{
 			name:    "same source and target",
+			pool:    dummyPool,
 			keyring: validKeyring,
 			cipher:  validCipher,
 			opts:    postgres.RewrapSystemKeysOptions{FromSystemKeyID: "old", ToSystemKeyID: "old"},
@@ -61,6 +76,7 @@ func TestRewrapSystemKeys_ValidatesOptions(t *testing.T) {
 		},
 		{
 			name:    "negative batch size",
+			pool:    dummyPool,
 			keyring: validKeyring,
 			cipher:  validCipher,
 			opts:    postgres.RewrapSystemKeysOptions{FromSystemKeyID: "old", ToSystemKeyID: "new", BatchSize: -1},
@@ -70,7 +86,7 @@ func TestRewrapSystemKeys_ValidatesOptions(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, err := store.RewrapSystemKeys(context.Background(), tt.keyring, tt.cipher, tt.opts)
+			_, err := postgres.RewrapSystemKeys(context.Background(), tt.pool, postgres.Config{}, tt.keyring, tt.cipher, tt.opts)
 			if err == nil {
 				t.Fatal("expected error, got nil")
 			}

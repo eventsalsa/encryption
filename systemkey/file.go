@@ -6,7 +6,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/eventsalsa/encryption/encerr"
+	"github.com/eventsalsa/encryption"
 )
 
 // FileKeyConfig holds the configuration for loading keys from files.
@@ -30,7 +30,7 @@ func NewKeyringFromFiles(cfg FileKeyConfig) (Keyring, error) {
 			return nil, fmt.Errorf("systemkey: decoding key %q: %w", id, err)
 		}
 		if len(decoded) != 32 {
-			return nil, fmt.Errorf("systemkey: key %q is %d bytes, want 32: %w", id, len(decoded), encerr.ErrInvalidKeySize)
+			return nil, fmt.Errorf("systemkey: key %q is %d bytes, want 32: %w", id, len(decoded), encryption.ErrInvalidKeySize)
 		}
 		keys[id] = decoded
 	}

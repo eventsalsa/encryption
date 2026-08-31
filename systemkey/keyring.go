@@ -3,7 +3,7 @@ package systemkey
 import (
 	"fmt"
 
-	"github.com/eventsalsa/encryption/encerr"
+	"github.com/eventsalsa/encryption"
 )
 
 // Keyring provides access to system-level encryption keys.
@@ -40,7 +40,7 @@ func (r *memoryKeyring) ActiveKey() (key []byte, keyID string) {
 func (r *memoryKeyring) Key(keyID string) ([]byte, error) {
 	k, ok := r.keys[keyID]
 	if !ok {
-		return nil, encerr.ErrKeyNotFound
+		return nil, encryption.ErrKeyNotFound
 	}
 	return k, nil
 }
