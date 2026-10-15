@@ -13,7 +13,25 @@ import (
 	"github.com/eventsalsa/encryption/kek"
 )
 
-const aadContextKey = "eventsalsa:aad"
+// DefaultContextKey is the default AWS KMS EncryptionContext map key used to
+// bind Additional Authenticated Data (AAD) when no custom key is provided via
+// WithContextKey.
+const DefaultContextKey = "eventsalsa:aad"
+
+// Option configures a Wrapper.
+type Option func(*Wrapper) error
+
+// WithContextKey overrides the AWS KMS EncryptionContext key used to store
+// base64-encoded AAD (default: DefaultContextKey).
+func WithContextKey(key string) Option {
+	return func(w *Wrapper) error {
+		if key == "" {
+			return fmt.Errorf("awskms: context key must not be empty: %w", encryption.ErrInvalidConfig)
+		}
+		w.contextKey = key
+		return nil
+	}
+}
 
 // Client defines the AWS KMS operations required by Wrapper.
 // It is satisfied by *kms.Client from github.com/aws/aws-sdk-go-v2/service/kms.
@@ -26,8 +44,9 @@ type Client interface {
 // Wrapper implements kek.Wrapper and kek.Rewrapper using AWS KMS.
 // The underlying KEK material never leaves AWS KMS.
 type Wrapper struct {
-	client Client
-	keyID  string
+	client     Client
+	keyID      string
+	contextKey string
 }
 
 var (
@@ -36,17 +55,27 @@ var (
 )
 
 // NewWrapper creates an AWS KMS KEK Wrapper for the given keyID (ARN, alias ARN, or key ID).
-func NewWrapper(client Client, keyID string) (*Wrapper, error) {
+func NewWrapper(client Client, keyID string, opts ...Option) (*Wrapper, error) {
 	if client == nil {
 		return nil, fmt.Errorf("awskms: client is nil: %w", encryption.ErrInvalidConfig)
 	}
 	if keyID == "" {
 		return nil, fmt.Errorf("awskms: key ID is required: %w", encryption.ErrInvalidConfig)
 	}
-	return &Wrapper{
-		client: client,
-		keyID:  keyID,
-	}, nil
+	w := &Wrapper{
+		client:     client,
+		keyID:      keyID,
+		contextKey: DefaultContextKey,
+	}
+	for _, opt := range opts {
+		if opt == nil {
+			continue
+		}
+		if err := opt(w); err != nil {
+			return nil, err
+		}
+	}
+	return w, nil
 }
 
 // ID returns the configured AWS KMS key identifier.
@@ -63,7 +92,7 @@ func (w *Wrapper) Wrap(ctx context.Context, dek, aad []byte) ([]byte, error) {
 	out, err := w.client.Encrypt(ctx, &kms.EncryptInput{
 		KeyId:             &w.keyID,
 		Plaintext:         dek,
-		EncryptionContext: buildEncryptionContext(aad),
+		EncryptionContext: buildEncryptionContext(w.contextKey, aad),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("awskms wrap with %q: %w: %w", w.keyID, err, encryption.ErrEncryption)
@@ -85,7 +114,7 @@ func (w *Wrapper) Unwrap(ctx context.Context, encryptedDEK, aad []byte) ([]byte,
 	out, err := w.client.Decrypt(ctx, &kms.DecryptInput{
 		KeyId:             &w.keyID,
 		CiphertextBlob:    encryptedDEK,
-		EncryptionContext: buildEncryptionContext(aad),
+		EncryptionContext: buildEncryptionContext(w.contextKey, aad),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("awskms unwrap with %q: %w: %w", w.keyID, err, encryption.ErrDecryption)
@@ -116,8 +145,8 @@ func (w *Wrapper) Rewrap(ctx context.Context, target kek.Wrapper, encryptedDEK, 
 		SourceKeyId:                  &w.keyID,
 		DestinationKeyId:             &targetAWS.keyID,
 		CiphertextBlob:               encryptedDEK,
-		SourceEncryptionContext:      buildEncryptionContext(sourceAAD),
-		DestinationEncryptionContext: buildEncryptionContext(targetAAD),
+		SourceEncryptionContext:      buildEncryptionContext(w.contextKey, sourceAAD),
+		DestinationEncryptionContext: buildEncryptionContext(targetAWS.contextKey, targetAAD),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("awskms rewrap from %q to %q: %w: %w", w.keyID, targetAWS.keyID, err, encryption.ErrEncryption)
@@ -129,11 +158,11 @@ func (w *Wrapper) Rewrap(ctx context.Context, target kek.Wrapper, encryptedDEK, 
 	return out.CiphertextBlob, nil
 }
 
-func buildEncryptionContext(aad []byte) map[string]string {
+func buildEncryptionContext(contextKey string, aad []byte) map[string]string {
 	if len(aad) == 0 {
 		return nil
 	}
 	return map[string]string{
-		aadContextKey: base64.StdEncoding.EncodeToString(aad),
+		contextKey: base64.StdEncoding.EncodeToString(aad),
 	}
 }

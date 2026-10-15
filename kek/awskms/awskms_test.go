@@ -41,6 +41,17 @@ func newMockKMSClient(t *testing.T, keyIDs ...string) *mockKMSClient {
 	return m
 }
 
+func encodeContext(ec map[string]string) []byte {
+	if len(ec) == 0 {
+		return nil
+	}
+	var buf bytes.Buffer
+	for k, v := range ec {
+		fmt.Fprintf(&buf, "%s=%s;", k, v)
+	}
+	return buf.Bytes()
+}
+
 func (m *mockKMSClient) Encrypt(ctx context.Context, params *kms.EncryptInput, _ ...func(*kms.Options)) (*kms.EncryptOutput, error) {
 	m.encryptCalls++
 	if params.KeyId == nil {
@@ -50,8 +61,7 @@ func (m *mockKMSClient) Encrypt(ctx context.Context, params *kms.EncryptInput, _
 	if !ok {
 		return nil, fmt.Errorf("unknown KMS key %q", *params.KeyId)
 	}
-	aad := []byte(params.EncryptionContext["eventsalsa:aad"])
-	ct, err := w.Wrap(ctx, params.Plaintext, aad)
+	ct, err := w.Wrap(ctx, params.Plaintext, encodeContext(params.EncryptionContext))
 	if err != nil {
 		return nil, err
 	}
@@ -70,8 +80,7 @@ func (m *mockKMSClient) Decrypt(ctx context.Context, params *kms.DecryptInput, _
 	if !ok {
 		return nil, fmt.Errorf("unknown KMS key %q", *params.KeyId)
 	}
-	aad := []byte(params.EncryptionContext["eventsalsa:aad"])
-	pt, err := w.Unwrap(ctx, params.CiphertextBlob, aad)
+	pt, err := w.Unwrap(ctx, params.CiphertextBlob, encodeContext(params.EncryptionContext))
 	if err != nil {
 		return nil, err
 	}
@@ -115,6 +124,46 @@ func TestNewWrapperValidation(t *testing.T) {
 	}
 	if _, err := awskms.NewWrapper(client, ""); !errors.Is(err, encryption.ErrInvalidConfig) {
 		t.Fatalf("empty keyID: err = %v, want ErrInvalidConfig", err)
+	}
+	if _, err := awskms.NewWrapper(client, "k1", awskms.WithContextKey("")); !errors.Is(err, encryption.ErrInvalidConfig) {
+		t.Fatalf("empty context key: err = %v, want ErrInvalidConfig", err)
+	}
+}
+
+func TestWithContextKeyIsolation(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	keyARN := "arn:aws:kms:us-east-1:111122223333:key/k1"
+	client := newMockKMSClient(t, keyARN)
+
+	wDefault, err := awskms.NewWrapper(client, keyARN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wCustom, err := awskms.NewWrapper(client, keyARN, awskms.WithContextKey("acme:aad"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dek := []byte("0123456789abcdef0123456789abcdef")
+	aad := []byte("scope-aad")
+
+	encCustom, err := wCustom.Wrap(ctx, dek, aad)
+	if err != nil {
+		t.Fatalf("Wrap custom: %v", err)
+	}
+
+	// Unwrapping with a different context key fails because the EncryptionContext map differs
+	if _, err := wDefault.Unwrap(ctx, encCustom, aad); !errors.Is(err, encryption.ErrDecryption) {
+		t.Fatalf("Unwrap mismatched context key: err = %v, want ErrDecryption", err)
+	}
+
+	got, err := wCustom.Unwrap(ctx, encCustom, aad)
+	if err != nil {
+		t.Fatalf("Unwrap matching custom context key: %v", err)
+	}
+	if !bytes.Equal(got, dek) {
+		t.Fatalf("got %x, want %x", got, dek)
 	}
 }
 
