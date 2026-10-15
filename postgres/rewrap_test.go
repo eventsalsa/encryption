@@ -2,93 +2,88 @@ package postgres_test
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
-	"github.com/eventsalsa/encryption/cipher"
+	"github.com/eventsalsa/encryption"
 	"github.com/eventsalsa/encryption/cipher/aesgcm"
+	"github.com/eventsalsa/encryption/envelope"
+	"github.com/eventsalsa/encryption/kek/local"
 	"github.com/eventsalsa/encryption/postgres"
-	"github.com/eventsalsa/encryption/systemkey"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-func TestRewrapSystemKeys_ValidatesOptions(t *testing.T) {
+func TestRewrapKeys_ValidatesOptions(t *testing.T) {
+	t.Parallel()
+
 	dummyPool := &pgxpool.Pool{}
-	validKeyring := systemkey.NewKeyring(map[string][]byte{
+	validKeyring, err := local.NewKeyringFromMap(map[string][]byte{
 		"old": makeSystemKey(1),
 		"new": makeSystemKey(2),
 	}, "new")
-	validCipher := aesgcm.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	validEnv := envelope.New(validKeyring, aesgcm.New())
 
 	tests := []struct {
 		name    string
 		pool    *pgxpool.Pool
-		keyring systemkey.Keyring
-		cipher  cipher.Cipher
-		opts    postgres.RewrapSystemKeysOptions
+		env     *envelope.Envelope
+		opts    postgres.RewrapKeysOptions
 		wantErr string
 	}{
 		{
 			name:    "nil pool",
 			pool:    nil,
-			keyring: validKeyring,
-			cipher:  validCipher,
-			opts:    postgres.RewrapSystemKeysOptions{FromSystemKeyID: "old", ToSystemKeyID: "new"},
+			env:     validEnv,
+			opts:    postgres.RewrapKeysOptions{FromKEKID: "old", ToKEKID: "new"},
 			wantErr: "pool is nil",
 		},
 		{
-			name:    "nil keyring",
+			name:    "nil envelope",
 			pool:    dummyPool,
-			cipher:  validCipher,
-			opts:    postgres.RewrapSystemKeysOptions{FromSystemKeyID: "old", ToSystemKeyID: "new"},
-			wantErr: "keyring is nil",
-		},
-		{
-			name:    "nil cipher",
-			pool:    dummyPool,
-			keyring: validKeyring,
-			opts:    postgres.RewrapSystemKeysOptions{FromSystemKeyID: "old", ToSystemKeyID: "new"},
-			wantErr: "cipher is nil",
+			env:     nil,
+			opts:    postgres.RewrapKeysOptions{FromKEKID: "old", ToKEKID: "new"},
+			wantErr: "envelope is nil",
 		},
 		{
 			name:    "missing source key",
 			pool:    dummyPool,
-			keyring: validKeyring,
-			cipher:  validCipher,
-			opts:    postgres.RewrapSystemKeysOptions{ToSystemKeyID: "new"},
-			wantErr: "source system key ID is required",
+			env:     validEnv,
+			opts:    postgres.RewrapKeysOptions{ToKEKID: "new"},
+			wantErr: "source KEK ID is required",
 		},
 		{
 			name:    "missing target key",
 			pool:    dummyPool,
-			keyring: validKeyring,
-			cipher:  validCipher,
-			opts:    postgres.RewrapSystemKeysOptions{FromSystemKeyID: "old"},
-			wantErr: "target system key ID is required",
+			env:     validEnv,
+			opts:    postgres.RewrapKeysOptions{FromKEKID: "old"},
+			wantErr: "target KEK ID is required",
 		},
 		{
 			name:    "same source and target",
 			pool:    dummyPool,
-			keyring: validKeyring,
-			cipher:  validCipher,
-			opts:    postgres.RewrapSystemKeysOptions{FromSystemKeyID: "old", ToSystemKeyID: "old"},
-			wantErr: "source and target system key IDs must differ",
+			env:     validEnv,
+			opts:    postgres.RewrapKeysOptions{FromKEKID: "old", ToKEKID: "old"},
+			wantErr: "source and target KEK IDs must differ",
 		},
 		{
 			name:    "negative batch size",
 			pool:    dummyPool,
-			keyring: validKeyring,
-			cipher:  validCipher,
-			opts:    postgres.RewrapSystemKeysOptions{FromSystemKeyID: "old", ToSystemKeyID: "new", BatchSize: -1},
+			env:     validEnv,
+			opts:    postgres.RewrapKeysOptions{FromKEKID: "old", ToKEKID: "new", BatchSize: -1},
 			wantErr: "batch size must be positive",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, err := postgres.RewrapSystemKeys(context.Background(), tt.pool, postgres.Config{}, tt.keyring, tt.cipher, tt.opts)
-			if err == nil {
-				t.Fatal("expected error, got nil")
+			t.Parallel()
+			_, err := postgres.RewrapKeys(context.Background(), tt.pool, postgres.Config{}, tt.env, tt.opts)
+			if !errors.Is(err, encryption.ErrInvalidConfig) {
+				t.Fatalf("error = %v, want ErrInvalidConfig", err)
 			}
 			if !strings.Contains(err.Error(), tt.wantErr) {
 				t.Fatalf("error = %q, want substring %q", err.Error(), tt.wantErr)

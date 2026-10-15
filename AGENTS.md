@@ -35,33 +35,33 @@ To maintain a clean and trace-friendly repository history, adhere strictly to th
 Before completing any coding task, execute the full local validation suite. All checks must pass without warnings or errors.
 
 ```bash
-# Canonical local check entrypoint
+# Canonical local check entrypoint (root module + KMS sub-modules)
 make check
 
-# Build the module
-go build ./...
+# Build the root module and sub-modules
+make build
 
 # Run the test suite with race detection
-go test -race ./...
+make test
 ```
 
-The validation suite requires Go 1.24+ and is designed with zero external runtime dependencies. The postgres store adapter requires a database driver supplied by the consumer.
+The validation suite requires Go 1.24+ and keeps the root module free of cloud SDK dependencies. Cloud KMS adapters (`kek/awskms`, `kek/gcpkms`) are isolated in their own Go sub-modules.
 
 ---
 
 ## 3. Architecture & Core Layout
 
-This repository provides an envelope encryption library for event-sourced systems.
+This repository provides a KMS-native envelope encryption library for event-sourced systems.
 
 ### Package Structure
 
 | Directory | Package | Role / Description |
 |-----------|---------|--------------------|
-| [errors.go](errors.go) / [zerobytes.go](zerobytes.go) | `encryption` | Root package defining sentinel errors (`ErrKeyNotFound`, etc.) and memory zeroing utilities. |
-| [cipher/](cipher) | `cipher` | Pluggable symmetric encryption interface and implementations (default: `cipher/aesgcm` AES-256-GCM). |
-| [systemkey/](systemkey) | `systemkey` | KEK (Key Encrypting Key) management abstractions and filesystem loaders. |
-| [envelope/](envelope) | `envelope` | Pure in-memory envelope encryption engine (DEK wrapping/unwrapping & data encrypt/decrypt). |
-| [postgres/](postgres) | `postgres` | Stateless PostgreSQL keystore and key lifecycle management (`CreateKey`, `RotateKey`, `GetActiveKey`, `GetKey`, `RevokeKeys`, `DestroyKeys`, `RewrapSystemKeys`). |
+| [errors.go](errors.go) / [key.go](key.go) / [zerobytes.go](zerobytes.go) | `encryption` | Root package defining sentinel errors, shared `EncryptedKey` / `KeyScope` domain types, and memory zeroing utilities. |
+| [cipher/](cipher) | `cipher` | Pluggable AEAD symmetric encryption interface with AAD support and implementations (default: `cipher/aesgcm` AES-256-GCM). |
+| [kek/](kek) | `kek` | Key Encryption Key (KEK) abstractions (`Wrapper`, `Rewrapper`, `Keyring`), `CachingKeyring` decorator, and local/cloud KMS providers (`kek/local`, `kek/awskms`, `kek/gcpkms`). |
+| [envelope/](envelope) | `envelope` | Envelope encryption engine coordinating KEK-based DEK wrapping/unwrapping/rewrapping with `KeyScope` AAD binding and reusable in-memory `Session` handles. |
+| [postgres/](postgres) | `postgres` | Stateless PostgreSQL keystore and key lifecycle management (`CreateKey`, `RotateKey`, `GetActiveKey`, `GetKey`, `RevokeKeys`, `DestroyKeys`, `RewrapKeys`). |
 | [postgres/migrations/](postgres/migrations) | `migrations` | Embedded PostgreSQL migration SQL and migration generator. |
 | [hash/](hash) | `hash` | Deterministic blind indexing (HMAC-SHA256). |
 
@@ -69,9 +69,8 @@ This repository provides an envelope encryption library for event-sourced system
 
 ## 4. Key Coding Conventions
 
-- **Acyclic Dependencies**: The root `encryption` package has zero internal imports and defines sentinel errors and `ZeroBytes`. Internal packages import `encryption` directly.
-- **Decoupled In-Memory Crypto**: `envelope.Envelope` is a pure in-memory engine with zero storage or context dependencies.
+- **Acyclic Dependencies**: The root `encryption` package has zero internal imports and defines sentinel errors, `EncryptedKey`, `KeyScope`, and `ZeroBytes`. Internal packages import `encryption` directly.
+- **KMS-Native KEK Boundary**: KEKs never cross interface boundaries as raw byte slices. All KEK operations flow through `kek.Wrapper` and `kek.Keyring` with `context.Context` and mandatory `KeyScope` AAD.
 - **Stateless Storage**: `postgres.Store` is stateless configuration only; all operations accept an unexported `conn pgxConn` interface satisfied by `*pgxpool.Pool`, `pgx.Tx`, and `*pgx.Conn`.
-- **Memory Hygiene**: Always scrub plaintext keys (DEKs) from memory when finished. Defer `encryption.ZeroBytes` immediately after generation or unwrapping.
-- **Scope Namespacing**: Keys are grouped by namespaces using `(scope, scopeID)` tuples to partition encryption scopes.
-
+- **Memory Hygiene**: Always scrub plaintext keys (DEKs) from memory when finished. Defer `encryption.ZeroBytes` or `session.Close()` immediately after unwrapping or opening a session.
+- **Scope Namespacing & AAD Binding**: Keys are grouped by `(scope, scopeID, keyVersion)` tuples and cryptographically bound to their scope via AAD to prevent confused-deputy / ciphertext-transplant attacks.

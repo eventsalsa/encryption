@@ -21,7 +21,7 @@ jobs:
       - uses: actions/checkout@v6
       - uses: actions/setup-go@v6
         with:
-          go-version: "1.25.11"
+          go-version: "stable"
 
       - name: Check formatting
         run: |
@@ -33,13 +33,30 @@ jobs:
           fi
 
       - name: Vet
-        run: go vet ./...
+        run: |
+          go vet ./...
+          go vet -C kek/awskms ./...
+          go vet -C kek/gcpkms ./...
 
-      - name: golangci-lint
+      - name: golangci-lint (root)
         uses: golangci/golangci-lint-action@v9
         with:
           version: latest
           args: --timeout=5m
+
+      - name: golangci-lint (kek/awskms)
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: latest
+          working-directory: kek/awskms
+          args: --config=../../.golangci.yml --timeout=5m
+
+      - name: golangci-lint (kek/gcpkms)
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: latest
+          working-directory: kek/gcpkms
+          args: --config=../../.golangci.yml --timeout=5m
 
   test:
     name: Test
@@ -48,10 +65,13 @@ jobs:
       - uses: actions/checkout@v6
       - uses: actions/setup-go@v6
         with:
-          go-version: "1.25.11"
+          go-version: "stable"
 
       - name: Run tests
-        run: go test -race -count=1 -coverprofile=coverage.out ./...
+        run: |
+          go test -race -count=1 -coverprofile=coverage.out ./...
+          go test -C kek/awskms -race -count=1 ./...
+          go test -C kek/gcpkms -race -count=1 ./...
 
       - name: Upload coverage
         if: always()
@@ -68,7 +88,7 @@ jobs:
       - uses: actions/checkout@v6
       - uses: actions/setup-go@v6
         with:
-          go-version: "1.25.11"
+          go-version: "stable"
 
       - name: Run integration tests
         run: go test -race -count=1 -tags=integration ./postgres/...

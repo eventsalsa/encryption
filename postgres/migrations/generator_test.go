@@ -41,10 +41,10 @@ func TestSQLAppliesSchemaAndTableOverrides(t *testing.T) {
 	if !strings.Contains(got, "CREATE TABLE IF NOT EXISTS custom_schema.custom_keys") {
 		t.Fatalf("expected custom schema and table in CREATE TABLE statement")
 	}
-	if !strings.Contains(got, "ON custom_schema.custom_keys(scope, scope_id, revoked_at)") {
+	if !strings.Contains(got, "ON custom_schema.custom_keys(scope, scope_id)") {
 		t.Fatalf("expected custom schema and table in index statement")
 	}
-	if !strings.Contains(got, "CREATE INDEX IF NOT EXISTS idx_custom_keys_active") {
+	if !strings.Contains(got, "CREATE UNIQUE INDEX IF NOT EXISTS idx_custom_keys_active") {
 		t.Fatalf("expected index names to follow custom table name")
 	}
 	if strings.Contains(got, "infrastructure.encryption_keys") {
