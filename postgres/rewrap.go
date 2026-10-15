@@ -5,24 +5,23 @@ import (
 	"fmt"
 
 	"github.com/eventsalsa/encryption"
-	"github.com/eventsalsa/encryption/cipher"
-	"github.com/eventsalsa/encryption/systemkey"
+	"github.com/eventsalsa/encryption/envelope"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 const defaultRewrapBatchSize = 100
 
-// RewrapSystemKeysOptions configures RewrapSystemKeys.
-type RewrapSystemKeysOptions struct {
-	FromSystemKeyID string
-	ToSystemKeyID   string
-	BatchSize       int
-	DryRun          bool
+// RewrapKeysOptions configures RewrapKeys.
+type RewrapKeysOptions struct {
+	FromKEKID string
+	ToKEKID   string
+	BatchSize int
+	DryRun    bool
 }
 
-// RewrapSystemKeysResult summarizes a system-key rewrap run.
-type RewrapSystemKeysResult struct {
+// RewrapKeysResult summarizes a KEK rewrap run.
+type RewrapKeysResult struct {
 	MatchedRows   int
 	RewrappedRows int
 	SkippedRows   int
@@ -30,25 +29,18 @@ type RewrapSystemKeysResult struct {
 	Batches       int
 }
 
-type rewrapCandidate struct {
-	Scope        string
-	ScopeID      string
-	KeyVersion   int
-	EncryptedDEK []byte
-}
-
-func (o RewrapSystemKeysOptions) normalize() (RewrapSystemKeysOptions, error) {
-	if o.FromSystemKeyID == "" {
-		return RewrapSystemKeysOptions{}, fmt.Errorf("source system key ID is required")
+func (o RewrapKeysOptions) normalize() (RewrapKeysOptions, error) {
+	if o.FromKEKID == "" {
+		return RewrapKeysOptions{}, fmt.Errorf("source KEK ID is required: %w", encryption.ErrInvalidConfig)
 	}
-	if o.ToSystemKeyID == "" {
-		return RewrapSystemKeysOptions{}, fmt.Errorf("target system key ID is required")
+	if o.ToKEKID == "" {
+		return RewrapKeysOptions{}, fmt.Errorf("target KEK ID is required: %w", encryption.ErrInvalidConfig)
 	}
-	if o.FromSystemKeyID == o.ToSystemKeyID {
-		return RewrapSystemKeysOptions{}, fmt.Errorf("source and target system key IDs must differ")
+	if o.FromKEKID == o.ToKEKID {
+		return RewrapKeysOptions{}, fmt.Errorf("source and target KEK IDs must differ: %w", encryption.ErrInvalidConfig)
 	}
 	if o.BatchSize < 0 {
-		return RewrapSystemKeysOptions{}, fmt.Errorf("batch size must be positive")
+		return RewrapKeysOptions{}, fmt.Errorf("batch size must be positive: %w", encryption.ErrInvalidConfig)
 	}
 	if o.BatchSize == 0 {
 		o.BatchSize = defaultRewrapBatchSize
@@ -56,56 +48,44 @@ func (o RewrapSystemKeysOptions) normalize() (RewrapSystemKeysOptions, error) {
 	return o, nil
 }
 
-// RewrapSystemKeys re-encrypts stored DEKs from one system key to another in
-// short PostgreSQL-managed batch transactions.
+// RewrapKeys re-encrypts stored DEKs from one KEK to another in short
+// PostgreSQL-managed batch transactions.
 //
-// This is an administrative operation for retiring old system keys. It updates
-// only the stored encrypted DEK and system_key_id for matching rows; it does
-// not create new DEK versions or touch application ciphertext.
-func RewrapSystemKeys(ctx context.Context, pool *pgxpool.Pool, cfg Config, keyring systemkey.Keyring, c cipher.Cipher, opts RewrapSystemKeysOptions) (RewrapSystemKeysResult, error) {
+// This is an administrative operation for retiring old KEKs or migrating across
+// KMS providers. It updates only the stored encrypted_dek and kek_id for
+// matching rows while preserving and verifying each row's (scope, scope_id, key_version) AAD.
+func RewrapKeys(ctx context.Context, pool *pgxpool.Pool, cfg Config, env *envelope.Envelope, opts RewrapKeysOptions) (RewrapKeysResult, error) {
 	if pool == nil {
-		return RewrapSystemKeysResult{}, fmt.Errorf("postgres rewrap: pool is nil")
+		return RewrapKeysResult{}, fmt.Errorf("postgres rewrap: pool is nil: %w", encryption.ErrInvalidConfig)
 	}
-	if keyring == nil {
-		return RewrapSystemKeysResult{}, fmt.Errorf("postgres rewrap: keyring is nil")
-	}
-	if c == nil {
-		return RewrapSystemKeysResult{}, fmt.Errorf("postgres rewrap: cipher is nil")
+	if env == nil {
+		return RewrapKeysResult{}, fmt.Errorf("postgres rewrap: envelope is nil: %w", encryption.ErrInvalidConfig)
 	}
 
 	cfg = ApplyDefaults(cfg)
 	opts, err := opts.normalize()
 	if err != nil {
-		return RewrapSystemKeysResult{}, fmt.Errorf("postgres rewrap: %w", err)
-	}
-
-	sourceKey, err := keyring.Key(opts.FromSystemKeyID)
-	if err != nil {
-		return RewrapSystemKeysResult{}, fmt.Errorf("postgres rewrap: get source system key: %w", err)
-	}
-	targetKey, err := keyring.Key(opts.ToSystemKeyID)
-	if err != nil {
-		return RewrapSystemKeysResult{}, fmt.Errorf("postgres rewrap: get target system key: %w", err)
+		return RewrapKeysResult{}, fmt.Errorf("postgres rewrap: %w", err)
 	}
 
 	fqtn := fmt.Sprintf("%s.%s", cfg.Schema, cfg.Table)
 
 	if opts.DryRun {
-		remaining, err := countRowsBySystemKey(ctx, pool, fqtn, opts.FromSystemKeyID)
+		remaining, err := countRowsByKEK(ctx, pool, fqtn, opts.FromKEKID)
 		if err != nil {
-			return RewrapSystemKeysResult{}, fmt.Errorf("postgres rewrap: count dry-run rows: %w", err)
+			return RewrapKeysResult{}, fmt.Errorf("postgres rewrap: count dry-run rows: %w", err)
 		}
-		return RewrapSystemKeysResult{
+		return RewrapKeysResult{
 			MatchedRows:   remaining,
 			RemainingRows: remaining,
 		}, nil
 	}
 
-	var result RewrapSystemKeysResult
+	var result RewrapKeysResult
 	for {
-		batch, err := rewrapSystemKeyBatch(ctx, pool, fqtn, sourceKey, targetKey, c, opts)
+		batch, err := rewrapKeyBatch(ctx, pool, fqtn, env, opts)
 		if err != nil {
-			return RewrapSystemKeysResult{}, err
+			return RewrapKeysResult{}, err
 		}
 		if batch.MatchedRows == 0 {
 			break
@@ -117,43 +97,44 @@ func RewrapSystemKeys(ctx context.Context, pool *pgxpool.Pool, cfg Config, keyri
 		result.Batches += batch.Batches
 	}
 
-	remaining, err := countRowsBySystemKey(ctx, pool, fqtn, opts.FromSystemKeyID)
+	remaining, err := countRowsByKEK(ctx, pool, fqtn, opts.FromKEKID)
 	if err != nil {
-		return RewrapSystemKeysResult{}, fmt.Errorf("postgres rewrap: count remaining rows: %w", err)
+		return RewrapKeysResult{}, fmt.Errorf("postgres rewrap: count remaining rows: %w", err)
 	}
 	result.RemainingRows = remaining
 
 	return result, nil
 }
 
-func rewrapSystemKeyBatch(ctx context.Context, pool *pgxpool.Pool, fqtn string, sourceKey, targetKey []byte, c cipher.Cipher, opts RewrapSystemKeysOptions) (RewrapSystemKeysResult, error) {
+func rewrapKeyBatch(ctx context.Context, pool *pgxpool.Pool, fqtn string, env *envelope.Envelope, opts RewrapKeysOptions) (RewrapKeysResult, error) {
 	tx, err := pool.Begin(ctx)
 	if err != nil {
-		return RewrapSystemKeysResult{}, fmt.Errorf("postgres rewrap: begin batch tx: %w", err)
+		return RewrapKeysResult{}, fmt.Errorf("postgres rewrap: begin batch tx: %w", err)
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck // Best-effort cleanup; commit path handles the success case explicitly.
 
-	candidates, err := selectRowsForRewrap(ctx, tx, fqtn, opts.FromSystemKeyID, opts.BatchSize)
+	candidates, err := selectRowsForRewrap(ctx, tx, fqtn, opts.FromKEKID, opts.BatchSize)
 	if err != nil {
-		return RewrapSystemKeysResult{}, fmt.Errorf("postgres rewrap: select batch: %w", err)
+		return RewrapKeysResult{}, fmt.Errorf("postgres rewrap: select batch: %w", err)
 	}
 	if len(candidates) == 0 {
-		return RewrapSystemKeysResult{}, nil
+		return RewrapKeysResult{}, nil
 	}
 
-	result := RewrapSystemKeysResult{
+	result := RewrapKeysResult{
 		MatchedRows: len(candidates),
 		Batches:     1,
 	}
-	for i, candidate := range candidates {
-		rewrappedDEK, err := rewrapDEK(candidate.EncryptedDEK, sourceKey, targetKey, c)
+	for i := range candidates {
+		candidate := &candidates[i]
+		rewrappedDEK, err := env.RewrapDEK(ctx, candidate, opts.ToKEKID)
 		if err != nil {
-			return RewrapSystemKeysResult{}, fmt.Errorf("postgres rewrap: rewrap batch row %d: %w", i, err)
+			return RewrapKeysResult{}, fmt.Errorf("postgres rewrap: rewrap batch row %d: %w", i, err)
 		}
 
 		updated, err := updateRewrappedRow(ctx, tx, fqtn, candidate, rewrappedDEK, opts)
 		if err != nil {
-			return RewrapSystemKeysResult{}, fmt.Errorf("postgres rewrap: update batch row %d: %w", i, err)
+			return RewrapKeysResult{}, fmt.Errorf("postgres rewrap: update batch row %d: %w", i, err)
 		}
 		if updated == 0 {
 			result.SkippedRows++
@@ -163,40 +144,30 @@ func rewrapSystemKeyBatch(ctx context.Context, pool *pgxpool.Pool, fqtn string, 
 	}
 
 	if err := tx.Commit(ctx); err != nil {
-		return RewrapSystemKeysResult{}, fmt.Errorf("postgres rewrap: commit batch tx: %w", err)
+		return RewrapKeysResult{}, fmt.Errorf("postgres rewrap: commit batch tx: %w", err)
 	}
 
 	return result, nil
 }
 
-func rewrapDEK(encryptedDEK, sourceKey, targetKey []byte, c cipher.Cipher) ([]byte, error) {
-	dek, err := c.Decrypt(sourceKey, encryptedDEK)
-	if err != nil {
-		return nil, err
-	}
-	defer encryption.ZeroBytes(dek)
-
-	return c.Encrypt(targetKey, dek)
-}
-
-func selectRowsForRewrap(ctx context.Context, tx pgx.Tx, fqtn, systemKeyID string, batchSize int) ([]rewrapCandidate, error) {
-	query := fmt.Sprintf(`SELECT scope, scope_id, key_version, encrypted_key
+func selectRowsForRewrap(ctx context.Context, tx pgx.Tx, fqtn, kekID string, batchSize int) ([]encryption.EncryptedKey, error) {
+	query := fmt.Sprintf(`SELECT scope, scope_id, key_version, encrypted_dek, kek_id
 		FROM %s
-		WHERE system_key_id = $1
+		WHERE kek_id = $1
 		ORDER BY scope, scope_id, key_version
 		LIMIT $2
 		FOR UPDATE SKIP LOCKED`, fqtn) //#nosec G201 -- fqtn is derived from trusted postgres.Config schema/table settings, not user input.
 
-	rows, err := tx.Query(ctx, query, systemKeyID, batchSize)
+	rows, err := tx.Query(ctx, query, kekID, batchSize)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close() //nolint:errcheck // Best-effort cleanup after QueryContext; rows.Err handles iteration failures.
+	defer rows.Close()
 
-	candidates := make([]rewrapCandidate, 0, batchSize)
+	candidates := make([]encryption.EncryptedKey, 0, batchSize)
 	for rows.Next() {
-		var candidate rewrapCandidate
-		if err := rows.Scan(&candidate.Scope, &candidate.ScopeID, &candidate.KeyVersion, &candidate.EncryptedDEK); err != nil {
+		var candidate encryption.EncryptedKey
+		if err := rows.Scan(&candidate.Scope, &candidate.ScopeID, &candidate.KeyVersion, &candidate.EncryptedDEK, &candidate.KEKID); err != nil {
 			return nil, err
 		}
 		candidates = append(candidates, candidate)
@@ -208,20 +179,20 @@ func selectRowsForRewrap(ctx context.Context, tx pgx.Tx, fqtn, systemKeyID strin
 	return candidates, nil
 }
 
-func updateRewrappedRow(ctx context.Context, tx pgx.Tx, fqtn string, candidate rewrapCandidate, encryptedDEK []byte, opts RewrapSystemKeysOptions) (int64, error) {
+func updateRewrappedRow(ctx context.Context, tx pgx.Tx, fqtn string, candidate *encryption.EncryptedKey, encryptedDEK []byte, opts RewrapKeysOptions) (int64, error) {
 	query := fmt.Sprintf(`UPDATE %s
-		SET encrypted_key = $1, system_key_id = $2
-		WHERE scope = $3 AND scope_id = $4 AND key_version = $5 AND system_key_id = $6`, fqtn) //#nosec G201 -- fqtn is derived from trusted postgres.Config schema/table settings, not user input.
+		SET encrypted_dek = $1, kek_id = $2
+		WHERE scope = $3 AND scope_id = $4 AND key_version = $5 AND kek_id = $6`, fqtn) //#nosec G201 -- fqtn is derived from trusted postgres.Config schema/table settings, not user input.
 
 	cmdTag, err := tx.Exec(
 		ctx,
 		query,
 		encryptedDEK,
-		opts.ToSystemKeyID,
+		opts.ToKEKID,
 		candidate.Scope,
 		candidate.ScopeID,
 		candidate.KeyVersion,
-		opts.FromSystemKeyID,
+		opts.FromKEKID,
 	)
 	if err != nil {
 		return 0, err
@@ -229,13 +200,13 @@ func updateRewrappedRow(ctx context.Context, tx pgx.Tx, fqtn string, candidate r
 	return cmdTag.RowsAffected(), nil
 }
 
-func countRowsBySystemKey(ctx context.Context, conn pgxConn, fqtn, systemKeyID string) (int, error) {
+func countRowsByKEK(ctx context.Context, conn pgxConn, fqtn, kekID string) (int, error) {
 	query := fmt.Sprintf(`SELECT COUNT(*)
 		FROM %s
-		WHERE system_key_id = $1`, fqtn)
+		WHERE kek_id = $1`, fqtn) //#nosec G201 -- fqtn is derived from trusted postgres.Config schema/table settings, not user input.
 
 	var count int
-	if err := conn.QueryRow(ctx, query, systemKeyID).Scan(&count); err != nil {
+	if err := conn.QueryRow(ctx, query, kekID).Scan(&count); err != nil {
 		return 0, err
 	}
 	return count, nil

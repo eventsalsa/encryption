@@ -14,4 +14,6 @@ var (
 	ErrInvalidKeySize = errors.New("invalid key size")
 	ErrKeyRevoked     = errors.New("encryption key has been revoked")
 	ErrKeyDestroyed   = errors.New("encryption key has been destroyed")
+	ErrSessionClosed  = errors.New("encryption session is closed")
+	ErrInvalidConfig  = errors.New("invalid encryption configuration")
 )

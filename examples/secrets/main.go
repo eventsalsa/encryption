@@ -8,8 +8,7 @@
 //  1. Secret v1 is created: store.CreateKey(ctx, conn, "api_token", "stripe")
 //  2. Payloads are encrypted under v1.
 //  3. When credentials rotate (e.g. 90-day policy), call store.RotateKey(ctx, conn, "api_token", "stripe").
-//     - Inserts DEK version 2.
-//     - Soft-revokes version 1 (revoked_at = NOW()).
+//     - Atomically soft-revokes version 1 (revoked_at = NOW()) and inserts DEK version 2.
 //  4. New writes automatically use active key version 2.
 //  5. Historical events/receipts encrypted under version 1 remain decryptable by fetching
 //     key version 1 explicitly: store.GetKey(ctx, conn, "api_token", "stripe", 1).
@@ -58,38 +57,30 @@ func run() error {
 	scope, secretID := "api_token", "stripe_production"
 
 	// 3. Initial Secret Creation (Version 1)
-	v1, err := store.CreateKey(ctx, pool, scope, secretID)
+	keyV1, err := store.CreateKey(ctx, pool, scope, secretID)
 	if err != nil {
 		return fmt.Errorf("create key v1: %w", err)
 	}
-	keyV1, err := store.GetActiveKey(ctx, pool, scope, secretID)
-	if err != nil {
-		return fmt.Errorf("get active key v1: %w", err)
-	}
 
 	secretPayloadV1 := "sk_live_2026_q1_initial_token_value"
-	cipherV1, err := env.Encrypt(keyV1.SystemKeyID, keyV1.EncryptedDEK, secretPayloadV1)
+	cipherV1, err := env.EncryptString(ctx, keyV1, secretPayloadV1, nil)
 	if err != nil {
 		return fmt.Errorf("encrypt v1: %w", err)
 	}
-	fmt.Printf("1. Created key version %d. Encrypted secret: %s\n", v1, cipherV1)
+	fmt.Printf("1. Created key version %d. Encrypted secret: %s\n", keyV1.KeyVersion, cipherV1)
 
 	// 4. 90-Day Secret Rotation: Generate Version 2 and soft-revoke Version 1
-	v2, err := store.RotateKey(ctx, pool, scope, secretID)
+	keyV2, err := store.RotateKey(ctx, pool, scope, secretID)
 	if err != nil {
 		return fmt.Errorf("rotate key to v2: %w", err)
 	}
-	keyV2, err := store.GetActiveKey(ctx, pool, scope, secretID)
-	if err != nil {
-		return fmt.Errorf("get active key v2: %w", err)
-	}
 
 	secretPayloadV2 := "sk_live_2026_q2_rotated_token_value"
-	cipherV2, err := env.Encrypt(keyV2.SystemKeyID, keyV2.EncryptedDEK, secretPayloadV2)
+	cipherV2, err := env.EncryptString(ctx, keyV2, secretPayloadV2, nil)
 	if err != nil {
 		return fmt.Errorf("encrypt v2: %w", err)
 	}
-	fmt.Printf("2. Rotated to active key version %d. Encrypted new secret: %s\n", v2, cipherV2)
+	fmt.Printf("2. Rotated to active key version %d. Encrypted new secret: %s\n", keyV2.KeyVersion, cipherV2)
 
 	// 5. Audit Verification: Historical and active secrets both decrypt accurately
 	histKeyV1, err := store.GetKey(ctx, pool, scope, secretID, 1)
@@ -98,11 +89,11 @@ func run() error {
 	}
 	fmt.Printf("3. Historical key v1 status: revoked_at = %s\n", histKeyV1.RevokedAt.Format(time.RFC3339))
 
-	plainV1, err := env.Decrypt(histKeyV1.SystemKeyID, histKeyV1.EncryptedDEK, cipherV1)
+	plainV1, err := env.DecryptString(ctx, histKeyV1, cipherV1, nil)
 	if err != nil {
 		return fmt.Errorf("decrypt v1: %w", err)
 	}
-	plainV2, err := env.Decrypt(keyV2.SystemKeyID, keyV2.EncryptedDEK, cipherV2)
+	plainV2, err := env.DecryptString(ctx, keyV2, cipherV2, nil)
 	if err != nil {
 		return fmt.Errorf("decrypt v2: %w", err)
 	}

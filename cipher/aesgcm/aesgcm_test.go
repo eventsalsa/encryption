@@ -22,13 +22,14 @@ func TestRoundtrip(t *testing.T) {
 	c := New()
 	key := validKey(t)
 	plaintext := []byte("hello, envelope encryption!")
+	aad := []byte("scope:user:1")
 
-	ciphertext, err := c.Encrypt(key, plaintext)
+	ciphertext, err := c.Encrypt(key, plaintext, aad)
 	if err != nil {
 		t.Fatalf("Encrypt: %v", err)
 	}
 
-	got, err := c.Decrypt(key, ciphertext)
+	got, err := c.Decrypt(key, ciphertext, aad)
 	if err != nil {
 		t.Fatalf("Decrypt: %v", err)
 	}
@@ -38,16 +39,58 @@ func TestRoundtrip(t *testing.T) {
 	}
 }
 
+func TestRoundtripNilAAD(t *testing.T) {
+	c := New()
+	key := validKey(t)
+	plaintext := []byte("no aad payload")
+
+	ciphertext, err := c.Encrypt(key, plaintext, nil)
+	if err != nil {
+		t.Fatalf("Encrypt: %v", err)
+	}
+
+	got, err := c.Decrypt(key, ciphertext, nil)
+	if err != nil {
+		t.Fatalf("Decrypt: %v", err)
+	}
+
+	if !bytes.Equal(got, plaintext) {
+		t.Errorf("Decrypt = %q, want %q", got, plaintext)
+	}
+}
+
+func TestAADMismatchFailsDecryption(t *testing.T) {
+	c := New()
+	key := validKey(t)
+	plaintext := []byte("bound secret")
+	aad := []byte("user:u-1:1")
+
+	ciphertext, err := c.Encrypt(key, plaintext, aad)
+	if err != nil {
+		t.Fatalf("Encrypt: %v", err)
+	}
+
+	// Wrong AAD
+	if _, err := c.Decrypt(key, ciphertext, []byte("user:u-2:1")); !errors.Is(err, encryption.ErrDecryption) {
+		t.Fatalf("Decrypt with wrong AAD: err = %v, want ErrDecryption", err)
+	}
+
+	// Missing AAD when encrypted with AAD
+	if _, err := c.Decrypt(key, ciphertext, nil); !errors.Is(err, encryption.ErrDecryption) {
+		t.Fatalf("Decrypt with nil AAD: err = %v, want ErrDecryption", err)
+	}
+}
+
 func TestRoundtripEmptyPlaintext(t *testing.T) {
 	c := New()
 	key := validKey(t)
 
-	ciphertext, err := c.Encrypt(key, []byte{})
+	ciphertext, err := c.Encrypt(key, []byte{}, nil)
 	if err != nil {
 		t.Fatalf("Encrypt empty: %v", err)
 	}
 
-	got, err := c.Decrypt(key, ciphertext)
+	got, err := c.Decrypt(key, ciphertext, nil)
 	if err != nil {
 		t.Fatalf("Decrypt empty: %v", err)
 	}
@@ -63,12 +106,12 @@ func TestKeyIsolation(t *testing.T) {
 	key2 := validKey(t)
 	plaintext := []byte("secret data")
 
-	ciphertext, err := c.Encrypt(key1, plaintext)
+	ciphertext, err := c.Encrypt(key1, plaintext, nil)
 	if err != nil {
 		t.Fatalf("Encrypt: %v", err)
 	}
 
-	_, err = c.Decrypt(key2, ciphertext)
+	_, err = c.Decrypt(key2, ciphertext, nil)
 	if err == nil {
 		t.Fatal("Decrypt with wrong key should fail")
 	}
@@ -81,7 +124,7 @@ func TestEncryptInvalidKeySize(t *testing.T) {
 	c := New()
 	for _, size := range []int{0, 15, 16, 24, 31, 33, 64} {
 		key := make([]byte, size)
-		_, err := c.Encrypt(key, []byte("data"))
+		_, err := c.Encrypt(key, []byte("data"), nil)
 		if !errors.Is(err, encryption.ErrInvalidKeySize) {
 			t.Errorf("Encrypt(key len %d): err = %v, want ErrInvalidKeySize", size, err)
 		}
@@ -92,7 +135,7 @@ func TestDecryptInvalidKeySize(t *testing.T) {
 	c := New()
 	for _, size := range []int{0, 16, 31, 33} {
 		key := make([]byte, size)
-		_, err := c.Decrypt(key, make([]byte, 100))
+		_, err := c.Decrypt(key, make([]byte, 100), nil)
 		if !errors.Is(err, encryption.ErrInvalidKeySize) {
 			t.Errorf("Decrypt(key len %d): err = %v, want ErrInvalidKeySize", size, err)
 		}
@@ -105,7 +148,7 @@ func TestDecryptShortCiphertext(t *testing.T) {
 
 	// Less than nonce (12) + tag (16) = 28 bytes
 	for _, size := range []int{0, 1, 12, 27} {
-		_, err := c.Decrypt(key, make([]byte, size))
+		_, err := c.Decrypt(key, make([]byte, size), nil)
 		if !errors.Is(err, encryption.ErrDecryption) {
 			t.Errorf("Decrypt(ciphertext len %d): err = %v, want ErrDecryption", size, err)
 		}
@@ -116,7 +159,7 @@ func TestDecryptTamperedCiphertext(t *testing.T) {
 	c := New()
 	key := validKey(t)
 
-	ciphertext, err := c.Encrypt(key, []byte("sensitive"))
+	ciphertext, err := c.Encrypt(key, []byte("sensitive"), nil)
 	if err != nil {
 		t.Fatalf("Encrypt: %v", err)
 	}
@@ -126,7 +169,7 @@ func TestDecryptTamperedCiphertext(t *testing.T) {
 	copy(tampered, ciphertext)
 	tampered[len(tampered)-1] ^= 0xFF
 
-	_, err = c.Decrypt(key, tampered)
+	_, err = c.Decrypt(key, tampered, nil)
 	if !errors.Is(err, encryption.ErrDecryption) {
 		t.Errorf("Decrypt tampered: err = %v, want ErrDecryption", err)
 	}
@@ -137,8 +180,8 @@ func TestUniqueNonces(t *testing.T) {
 	key := validKey(t)
 	plaintext := []byte("same plaintext")
 
-	ct1, _ := c.Encrypt(key, plaintext)
-	ct2, _ := c.Encrypt(key, plaintext)
+	ct1, _ := c.Encrypt(key, plaintext, nil)
+	ct2, _ := c.Encrypt(key, plaintext, nil)
 
 	// Nonces are the first 12 bytes — they must differ
 	if bytes.Equal(ct1[:12], ct2[:12]) {

@@ -2,167 +2,249 @@ package envelope_test
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
+	"errors"
 	"testing"
 
+	"github.com/eventsalsa/encryption"
 	"github.com/eventsalsa/encryption/cipher/aesgcm"
 	"github.com/eventsalsa/encryption/envelope"
-	"github.com/eventsalsa/encryption/systemkey"
+	"github.com/eventsalsa/encryption/kek/local"
 )
 
-func setupTestEnvelope(t *testing.T) (env *envelope.Envelope, keyID string, sysKey []byte) {
+func setupTestEnvelope(t *testing.T) (env *envelope.Envelope, kekID string) {
 	t.Helper()
 
 	c := aesgcm.New()
-	sysKey = make([]byte, c.KeySize())
-	if _, err := rand.Read(sysKey); err != nil {
-		t.Fatalf("generate sysKey: %v", err)
+	rawKEK := make([]byte, c.KeySize())
+	if _, err := rand.Read(rawKEK); err != nil {
+		t.Fatalf("generate KEK: %v", err)
 	}
 
-	keyID = "sys-key-1"
-	keyring := systemkey.NewKeyring(map[string][]byte{keyID: sysKey}, keyID)
-	env = envelope.New(keyring, c)
-
-	return env, keyID, sysKey
+	kekID = "kek-1"
+	keyring, err := local.NewKeyringFromMap(map[string][]byte{kekID: rawKEK}, kekID)
+	if err != nil {
+		t.Fatalf("NewKeyringFromMap: %v", err)
+	}
+	return envelope.New(keyring, c), kekID
 }
 
-func TestEnvelopeEncryptDecryptRoundtrip(t *testing.T) {
-	env, keyID, _ := setupTestEnvelope(t)
+func makeEncryptedKey(t *testing.T, env *envelope.Envelope, scope encryption.KeyScope) *encryption.EncryptedKey {
+	t.Helper()
+	ctx := context.Background()
 
 	dek, err := env.GenerateDEK()
 	if err != nil {
 		t.Fatalf("GenerateDEK: %v", err)
 	}
+	defer encryption.ZeroBytes(dek)
 
-	encDEK, err := env.WrapDEK(keyID, dek)
+	kekID, encDEK, err := env.WrapDEK(ctx, scope, dek)
 	if err != nil {
 		t.Fatalf("WrapDEK: %v", err)
 	}
 
-	plaintext := "Hello, pure in-memory envelope encryption!"
-	ciphertext, err := env.Encrypt(keyID, encDEK, plaintext)
+	return &encryption.EncryptedKey{
+		Scope:        scope.Scope,
+		ScopeID:      scope.ScopeID,
+		KeyVersion:   scope.KeyVersion,
+		EncryptedDEK: encDEK,
+		KEKID:        kekID,
+	}
+}
+
+func TestEnvelopeBytesAndStringRoundtrip(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	env, _ := setupTestEnvelope(t)
+
+	scope := encryption.KeyScope{Scope: "user-pii", ScopeID: "u-123", KeyVersion: 1}
+	key := makeEncryptedKey(t, env, scope)
+
+	payloadAAD := []byte("field:email")
+	plaintext := []byte("alice@example.com")
+
+	ct, err := env.Encrypt(ctx, key, plaintext, payloadAAD)
 	if err != nil {
 		t.Fatalf("Encrypt: %v", err)
 	}
 
-	decrypted, err := env.Decrypt(keyID, encDEK, ciphertext)
+	// Mismatched payload AAD must fail
+	if _, err := env.Decrypt(ctx, key, ct, []byte("field:phone")); !errors.Is(err, encryption.ErrDecryption) {
+		t.Fatalf("Decrypt with wrong payload AAD: err = %v, want ErrDecryption", err)
+	}
+
+	pt, err := env.Decrypt(ctx, key, ct, payloadAAD)
 	if err != nil {
 		t.Fatalf("Decrypt: %v", err)
 	}
+	if !bytes.Equal(pt, plaintext) {
+		t.Fatalf("got %q, want %q", pt, plaintext)
+	}
 
-	if decrypted != plaintext {
-		t.Fatalf("roundtrip failed: got %q, want %q", decrypted, plaintext)
+	// String roundtrip
+	strCT, err := env.EncryptString(ctx, key, "hello string", payloadAAD)
+	if err != nil {
+		t.Fatalf("EncryptString: %v", err)
+	}
+	strPT, err := env.DecryptString(ctx, key, strCT, payloadAAD)
+	if err != nil {
+		t.Fatalf("DecryptString: %v", err)
+	}
+	if strPT != "hello string" {
+		t.Fatalf("got %q, want %q", strPT, "hello string")
 	}
 }
 
-func TestEnvelopeWrapUnwrapDEKRoundtrip(t *testing.T) {
-	env, keyID, _ := setupTestEnvelope(t)
+func TestEnvelopeScopeAAD_PreventsCiphertextTransplant(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	env, _ := setupTestEnvelope(t)
 
-	dek, err := env.GenerateDEK()
-	if err != nil {
-		t.Fatalf("GenerateDEK: %v", err)
+	scopeA := encryption.KeyScope{Scope: "user", ScopeID: "alice", KeyVersion: 1}
+	keyA := makeEncryptedKey(t, env, scopeA)
+
+	// Simulate an attacker transplanting Alice's EncryptedDEK onto Bob's row or a different version.
+	transplantedScopeID := *keyA
+	transplantedScopeID.ScopeID = "bob"
+	if _, err := env.UnwrapDEK(ctx, &transplantedScopeID); !errors.Is(err, encryption.ErrDecryption) {
+		t.Fatalf("expected ErrDecryption when ScopeID is transplanted, got %v", err)
 	}
 
-	encDEK, err := env.WrapDEK(keyID, dek)
-	if err != nil {
-		t.Fatalf("WrapDEK: %v", err)
+	transplantedScope := *keyA
+	transplantedScope.Scope = "admin"
+	if _, err := env.UnwrapDEK(ctx, &transplantedScope); !errors.Is(err, encryption.ErrDecryption) {
+		t.Fatalf("expected ErrDecryption when Scope is transplanted, got %v", err)
 	}
 
-	unwrapped, err := env.UnwrapDEK(keyID, encDEK)
-	if err != nil {
-		t.Fatalf("UnwrapDEK: %v", err)
-	}
-
-	if !bytes.Equal(unwrapped, dek) {
-		t.Fatal("unwrapped DEK does not match original DEK")
-	}
-}
-
-func TestEnvelopeUnknownSystemKey(t *testing.T) {
-	env, _, _ := setupTestEnvelope(t)
-
-	dek, err := env.GenerateDEK()
-	if err != nil {
-		t.Fatalf("GenerateDEK: %v", err)
-	}
-
-	_, err = env.WrapDEK("non-existent-key", dek)
-	if err == nil {
-		t.Fatal("expected error wrapping with non-existent system key")
-	}
-
-	_, err = env.Encrypt("non-existent-key", []byte("dummy-enc-dek"), "plaintext")
-	if err == nil {
-		t.Fatal("expected error encrypting with non-existent system key")
-	}
-
-	_, err = env.Decrypt("non-existent-key", []byte("dummy-enc-dek"), "ciphertext")
-	if err == nil {
-		t.Fatal("expected error decrypting with non-existent system key")
+	transplantedVersion := *keyA
+	transplantedVersion.KeyVersion = 2
+	if _, err := env.UnwrapDEK(ctx, &transplantedVersion); !errors.Is(err, encryption.ErrDecryption) {
+		t.Fatalf("expected ErrDecryption when KeyVersion is transplanted, got %v", err)
 	}
 }
 
-func TestEnvelopeTamperedCiphertext(t *testing.T) {
-	env, keyID, _ := setupTestEnvelope(t)
+func TestEnvelopeSessionLifecycle(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	env, _ := setupTestEnvelope(t)
 
-	dek, err := env.GenerateDEK()
+	key := makeEncryptedKey(t, env, encryption.KeyScope{Scope: "stream", ScopeID: "s-1", KeyVersion: 1})
+
+	session, err := env.OpenSession(ctx, key)
 	if err != nil {
-		t.Fatalf("GenerateDEK: %v", err)
+		t.Fatalf("OpenSession: %v", err)
 	}
 
-	encDEK, err := env.WrapDEK(keyID, dek)
+	ct1, err := session.Encrypt([]byte("event-1"), []byte("seq:1"))
 	if err != nil {
-		t.Fatalf("WrapDEK: %v", err)
+		t.Fatalf("session.Encrypt 1: %v", err)
+	}
+	ct2, err := session.EncryptString("event-2", []byte("seq:2"))
+	if err != nil {
+		t.Fatalf("session.EncryptString 2: %v", err)
 	}
 
-	ciphertext, err := env.Encrypt(keyID, encDEK, "my confidential data")
+	pt1, err := session.Decrypt(ct1, []byte("seq:1"))
 	if err != nil {
-		t.Fatalf("Encrypt: %v", err)
+		t.Fatalf("session.Decrypt 1: %v", err)
+	}
+	if string(pt1) != "event-1" {
+		t.Fatalf("got %q, want event-1", pt1)
 	}
 
-	// Tamper with ciphertext by flipping a character
-	tampered := []byte(ciphertext)
-	tampered[len(tampered)/2] ^= 0xff
+	pt2, err := session.DecryptString(ct2, []byte("seq:2"))
+	if err != nil {
+		t.Fatalf("session.DecryptString 2: %v", err)
+	}
+	if pt2 != "event-2" {
+		t.Fatalf("got %q, want event-2", pt2)
+	}
 
-	_, err = env.Decrypt(keyID, encDEK, string(tampered))
-	if err == nil {
-		t.Fatal("expected error decrypting tampered ciphertext")
+	// Close scrubs the DEK and rejects any further use.
+	session.Close()
+	session.Close() // Idempotent
+
+	if _, err := session.Encrypt([]byte("x"), nil); !errors.Is(err, encryption.ErrSessionClosed) {
+		t.Fatalf("Encrypt after Close: err = %v, want ErrSessionClosed", err)
+	}
+	if _, err := session.Decrypt(ct1, []byte("seq:1")); !errors.Is(err, encryption.ErrSessionClosed) {
+		t.Fatalf("Decrypt after Close: err = %v, want ErrSessionClosed", err)
 	}
 }
 
-func TestEnvelopeTamperedEncryptedDEK(t *testing.T) {
-	env, keyID, _ := setupTestEnvelope(t)
+func TestEnvelopeRewrapDEK(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
 
-	dek, err := env.GenerateDEK()
+	c := aesgcm.New()
+	k1 := make([]byte, 32)
+	k2 := make([]byte, 32)
+	_, _ = rand.Read(k1)
+	_, _ = rand.Read(k2)
+
+	kr, err := local.NewKeyringFromMap(map[string][]byte{
+		"kek-1": k1,
+		"kek-2": k2,
+	}, "kek-1")
 	if err != nil {
-		t.Fatalf("GenerateDEK: %v", err)
+		t.Fatal(err)
+	}
+	env := envelope.New(kr, c)
+
+	scope := encryption.KeyScope{Scope: "user", ScopeID: "u-1", KeyVersion: 1}
+	key := makeEncryptedKey(t, env, scope)
+
+	ct, err := env.EncryptString(ctx, key, "secret-payload", nil)
+	if err != nil {
+		t.Fatal(err)
 	}
 
-	encDEK, err := env.WrapDEK(keyID, dek)
+	rewrappedDEK, err := env.RewrapDEK(ctx, key, "kek-2")
 	if err != nil {
-		t.Fatalf("WrapDEK: %v", err)
+		t.Fatalf("RewrapDEK: %v", err)
 	}
 
-	ciphertext, err := env.Encrypt(keyID, encDEK, "my confidential data")
+	rewrappedKey := *key
+	rewrappedKey.KEKID = "kek-2"
+	rewrappedKey.EncryptedDEK = rewrappedDEK
+
+	pt, err := env.DecryptString(ctx, &rewrappedKey, ct, nil)
 	if err != nil {
-		t.Fatalf("Encrypt: %v", err)
+		t.Fatalf("DecryptString after RewrapDEK: %v", err)
 	}
-
-	// Tamper with encDEK
-	tamperedDEK := make([]byte, len(encDEK))
-	copy(tamperedDEK, encDEK)
-	tamperedDEK[len(tamperedDEK)/2] ^= 0xff
-
-	_, err = env.Decrypt(keyID, tamperedDEK, ciphertext)
-	if err == nil {
-		t.Fatal("expected error decrypting with tampered encrypted DEK")
+	if pt != "secret-payload" {
+		t.Fatalf("got %q, want secret-payload", pt)
 	}
 }
 
-func TestEnvelopeActiveKeyID(t *testing.T) {
-	env, keyID, _ := setupTestEnvelope(t)
+func TestEnvelopeUnknownKEK(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	env, _ := setupTestEnvelope(t)
 
-	if got := env.ActiveKeyID(); got != keyID {
-		t.Fatalf("ActiveKeyID: got %q, want %q", got, keyID)
+	key := &encryption.EncryptedKey{
+		Scope:        "user",
+		ScopeID:      "u-1",
+		KeyVersion:   1,
+		EncryptedDEK: []byte("dummy"),
+		KEKID:        "unknown-kek",
+	}
+
+	if _, err := env.Encrypt(ctx, key, []byte("data"), nil); !errors.Is(err, encryption.ErrKeyNotFound) {
+		t.Fatalf("Encrypt unknown KEK: err = %v, want ErrKeyNotFound", err)
+	}
+	if _, err := env.Decrypt(ctx, key, []byte("data"), nil); !errors.Is(err, encryption.ErrKeyNotFound) {
+		t.Fatalf("Decrypt unknown KEK: err = %v, want ErrKeyNotFound", err)
+	}
+}
+
+func TestEnvelopeActiveKEKID(t *testing.T) {
+	t.Parallel()
+	env, kekID := setupTestEnvelope(t)
+
+	if got := env.ActiveKEKID(); got != kekID {
+		t.Fatalf("ActiveKEKID: got %q, want %q", got, kekID)
 	}
 }

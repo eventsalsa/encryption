@@ -62,19 +62,15 @@ func run() error {
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	v, err := store.CreateKey(ctx, tx, scope, userID)
+	key, err := store.CreateKey(ctx, tx, scope, userID)
 	if err != nil {
 		return fmt.Errorf("create key: %w", err)
 	}
-	fmt.Printf("1. Created PII key version %d for user %s inside transaction\n", v, userID)
-
-	key, err := store.GetActiveKey(ctx, tx, scope, userID)
-	if err != nil {
-		return fmt.Errorf("get active key: %w", err)
-	}
+	fmt.Printf("1. Created PII key version %d for user %s inside transaction\n", key.KeyVersion, userID)
 
 	// 4. Encrypt user PII in-memory (zero DB overhead)
-	ciphertext, err := env.Encrypt(key.SystemKeyID, key.EncryptedDEK, "alice.smith@example.com")
+	payloadAAD := []byte("field:email")
+	ciphertext, err := env.EncryptString(ctx, key, "alice.smith@example.com", payloadAAD)
 	if err != nil {
 		return fmt.Errorf("encrypt: %w", err)
 	}
@@ -89,7 +85,7 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("get active key: %w", err)
 	}
-	decrypted, err := env.Decrypt(readKey.SystemKeyID, readKey.EncryptedDEK, ciphertext)
+	decrypted, err := env.DecryptString(ctx, readKey, ciphertext, payloadAAD)
 	if err != nil {
 		return fmt.Errorf("decrypt: %w", err)
 	}

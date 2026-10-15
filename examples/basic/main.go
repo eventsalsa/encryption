@@ -1,7 +1,8 @@
-// Example: in-memory envelope encryption with envelope.Envelope.
+// Example: envelope encryption with envelope.Envelope and envelope.Session.
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 
@@ -19,37 +20,48 @@ func main() {
 }
 
 func run() error {
-	// 1. Set up system keyring and symmetric cipher.
+	ctx := context.Background()
+
+	// 1. Set up KEK keyring and symmetric data cipher.
 	keyring := testutil.NewTestKeyring()
 	c := aesgcm.New()
 
-	// 2. Initialize in-memory envelope engine.
+	// 2. Initialize envelope engine.
 	env := envelope.New(keyring, c)
 
-	// 3. Generate a fresh DEK in-memory and wrap it with the active system key.
+	// 3. Generate a fresh DEK and wrap it with the active KEK bound to a KeyScope.
 	dek, err := env.GenerateDEK()
 	if err != nil {
 		return fmt.Errorf("generate DEK: %w", err)
 	}
 	defer encryption.ZeroBytes(dek)
 
-	sysKeyID := env.ActiveKeyID()
-	encDEK, err := env.WrapDEK(sysKeyID, dek)
+	scope := encryption.KeyScope{Scope: "user-pii", ScopeID: "user-1", KeyVersion: 1}
+	kekID, encDEK, err := env.WrapDEK(ctx, scope, dek)
 	if err != nil {
 		return fmt.Errorf("wrap DEK: %w", err)
 	}
-	fmt.Printf("Generated DEK (%d bytes) wrapped with system key %q\n", len(dek), sysKeyID)
+	fmt.Printf("Generated DEK (%d bytes) wrapped with KEK %q\n", len(dek), kekID)
 
-	// 4. Encrypt plaintext using the wrapped DEK.
+	key := &encryption.EncryptedKey{
+		Scope:        scope.Scope,
+		ScopeID:      scope.ScopeID,
+		KeyVersion:   scope.KeyVersion,
+		EncryptedDEK: encDEK,
+		KEKID:        kekID,
+	}
+
+	// 4. Encrypt plaintext using the wrapped DEK and optional payload AAD.
 	plaintext := "Hello, envelope encryption!"
-	ciphertext, err := env.Encrypt(sysKeyID, encDEK, plaintext)
+	payloadAAD := []byte("field:greeting")
+	ciphertext, err := env.EncryptString(ctx, key, plaintext, payloadAAD)
 	if err != nil {
 		return fmt.Errorf("encrypt: %w", err)
 	}
 	fmt.Printf("Encrypted ciphertext: %s\n", ciphertext)
 
 	// 5. Decrypt ciphertext back to plaintext.
-	decrypted, err := env.Decrypt(sysKeyID, encDEK, ciphertext)
+	decrypted, err := env.DecryptString(ctx, key, ciphertext, payloadAAD)
 	if err != nil {
 		return fmt.Errorf("decrypt: %w", err)
 	}

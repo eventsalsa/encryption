@@ -31,10 +31,11 @@ func (c *Cipher) KeySize() int {
 	return keySize
 }
 
-// Encrypt encrypts plaintext with the given key using AES-256-GCM.
+// Encrypt encrypts plaintext with the given key and Additional Authenticated Data
+// (aad) using AES-256-GCM.
 // The key must be exactly 32 bytes. A random 12-byte nonce is generated
 // for each call. Returns [nonce][ciphertext][tag].
-func (c *Cipher) Encrypt(key, plaintext []byte) ([]byte, error) {
+func (c *Cipher) Encrypt(key, plaintext, aad []byte) ([]byte, error) {
 	if len(key) != keySize {
 		return nil, fmt.Errorf("aesgcm encrypt: expected %d-byte key, got %d: %w", keySize, len(key), encryption.ErrInvalidKeySize)
 	}
@@ -54,13 +55,14 @@ func (c *Cipher) Encrypt(key, plaintext []byte) ([]byte, error) {
 		return nil, fmt.Errorf("aesgcm encrypt: generate nonce: %w", encryption.ErrEncryption)
 	}
 
-	ciphertext := aead.Seal(nonce, nonce, plaintext, nil)
+	ciphertext := aead.Seal(nonce, nonce, plaintext, aad)
 	return ciphertext, nil
 }
 
-// Decrypt decrypts ciphertext with the given key using AES-256-GCM.
+// Decrypt decrypts ciphertext with the given key and verifies the Additional
+// Authenticated Data (aad) using AES-256-GCM.
 // The key must be exactly 32 bytes. Expects [nonce][ciphertext][tag] format.
-func (c *Cipher) Decrypt(key, ciphertext []byte) ([]byte, error) {
+func (c *Cipher) Decrypt(key, ciphertext, aad []byte) ([]byte, error) {
 	if len(key) != keySize {
 		return nil, fmt.Errorf("aesgcm decrypt: expected %d-byte key, got %d: %w", keySize, len(key), encryption.ErrInvalidKeySize)
 	}
@@ -84,7 +86,7 @@ func (c *Cipher) Decrypt(key, ciphertext []byte) ([]byte, error) {
 	nonce := ciphertext[:nonceSize]
 	encrypted := ciphertext[nonceSize:]
 
-	plaintext, err := aead.Open(nil, nonce, encrypted, nil)
+	plaintext, err := aead.Open(nil, nonce, encrypted, aad)
 	if err != nil {
 		return nil, fmt.Errorf("aesgcm decrypt: %w", encryption.ErrDecryption)
 	}
