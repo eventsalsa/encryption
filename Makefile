@@ -53,7 +53,7 @@ gosec:
 	gosec -no-fail -exclude-dir=kek/awskms -exclude-dir=kek/gcpkms -fmt sarif -out "$$tmp" ./...
 	@for mod in $(SUBMODULES); do \
 		tmp=$$(mktemp --suffix=.sarif); \
-		(cd "$$mod" && gosec -no-fail -fmt sarif -out "$$tmp" ./...); \
+		(cd "$$mod" && gosec -no-fail -fmt sarif -out "$$tmp" ./...) || { rm -f "$$tmp"; exit 1; }; \
 		rm -f "$$tmp"; \
 	done
 

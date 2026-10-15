@@ -62,7 +62,7 @@ func run() error {
 		return fmt.Errorf("create key v1: %w", err)
 	}
 
-	secretPayloadV1 := "sk_live_2026_q1_initial_token_value"
+	secretPayloadV1 := "sk_live_2026_q1_initial_token_value" // #nosec G101 -- synthetic example payload
 	cipherV1, err := env.EncryptString(ctx, keyV1, secretPayloadV1, nil)
 	if err != nil {
 		return fmt.Errorf("encrypt v1: %w", err)
@@ -75,7 +75,7 @@ func run() error {
 		return fmt.Errorf("rotate key to v2: %w", err)
 	}
 
-	secretPayloadV2 := "sk_live_2026_q2_rotated_token_value"
+	secretPayloadV2 := "sk_live_2026_q2_rotated_token_value" // #nosec G101 -- synthetic example payload
 	cipherV2, err := env.EncryptString(ctx, keyV2, secretPayloadV2, nil)
 	if err != nil {
 		return fmt.Errorf("encrypt v2: %w", err)

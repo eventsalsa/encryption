@@ -17,8 +17,8 @@ linters:
         - performance
         - style
     gosec:
-      severity: medium
-      confidence: medium
+      severity: low
+      confidence: low
     revive:
       rules:
         - name: blank-imports
