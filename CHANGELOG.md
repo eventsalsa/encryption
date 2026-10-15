@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.0.6](https://github.com/eventsalsa/encryption/compare/v0.0.5...v0.0.6) (2026-10-15)
+
+
+### ⚠ BREAKING CHANGES
+
+* redesign envelope encryption for KMS-native KEK providers ([#17](https://github.com/eventsalsa/encryption/issues/17))
+
+### Features
+
+* redesign envelope encryption for KMS-native KEK providers ([#17](https://github.com/eventsalsa/encryption/issues/17)) ([7ff377c](https://github.com/eventsalsa/encryption/commit/7ff377c66d331be3701a194c1b78cfd81e3dcbaa))
+
 ## [0.0.5](https://github.com/eventsalsa/encryption/compare/v0.0.4...v0.0.5) (2026-08-31)
 
 
