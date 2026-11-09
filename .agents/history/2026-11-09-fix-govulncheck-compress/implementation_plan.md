@@ -1,16 +1,22 @@
-# Implementation Plan: Remediate GO-2026-6865 in govulncheck
+# Implementation Plan: Isolate `examples/` Module & Remediate GO-2026-6865
 
-Upgrade indirect dependency `github.com/klauspost/compress` to `v1.20.2` to resolve vulnerability `GO-2026-6865` / `GHSA-fpmh-frq8-7rj8` causing the scheduled `Security` workflow run to fail.
+Decouple the `examples/` package tree into an isolated Go sub-module (`github.com/eventsalsa/encryption/examples`) so container tooling (`testcontainers-go` and its indirect dependencies) is separated from the core library.
 
 ## Proposed Changes
 
-### Dependencies
-- Upgrade `github.com/klauspost/compress` from `v1.18.7` to `v1.20.2` in `go.mod` and `go.sum`.
-- Run `go mod tidy` to clean up checksums and indirect dependency annotations.
+### Module Isolation
+- Initialize `examples/go.mod` for `github.com/eventsalsa/encryption/examples` with a local replace directive (`replace github.com/eventsalsa/encryption => ../`).
+- Revert the manual bump of `klauspost/compress` in root `go.mod` back to `v1.18.7` to prove the core library is untouched and clean.
+- Update `examples/go.mod` with `klauspost/compress@v1.20.2` so the example harness is also vulnerability-free.
+
+### Build & CI Tooling
+- Update `Makefile`: Add `examples` to `SUBMODULES` and update config paths for `golangci-lint` and `gosec`.
+- Update `.github/workflows/ci.yml`: Add `examples` module to `Vet`, `golangci-lint`, and `test` jobs.
+- Update `.github/workflows/security.yml`: Add `examples` module to `gosec`, `govulncheck`, and `codeql` matrices/steps.
+- Update `.github/dependabot.yml`: Add `/examples` directory for weekly Go module updates.
 
 ## Verification Plan
 
-### Automated Tests
-- Run `govulncheck ./... && govulncheck -C kek/awskms ./... && govulncheck -C kek/gcpkms ./...` to verify zero reachable vulnerabilities.
-- Run `make check` (go vet, golangci-lint, unit tests with race detector, integration tests, gosec, govulncheck).
-- Run `make build` and `make test`.
+### Automated Checks
+- Run `govulncheck ./... && govulncheck -C kek/awskms ./... && govulncheck -C kek/gcpkms ./... && govulncheck -C examples ./...`
+- Run `make check`, `make build`, and `make test`.
