@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.0.7](https://github.com/eventsalsa/encryption/compare/v0.0.6...v0.0.7) (2026-11-09)
+
+
+### Refactoring
+
+* isolate examples into sub-module to resolve govulncheck GO-2026-6865 ([#20](https://github.com/eventsalsa/encryption/issues/20)) ([16e9ce2](https://github.com/eventsalsa/encryption/commit/16e9ce27fb74c47933f1f26bf854b5978124a5f5))
+
 ## [0.0.6](https://github.com/eventsalsa/encryption/compare/v0.0.5...v0.0.6) (2026-10-15)
 
 
