@@ -26,12 +26,15 @@ jobs:
         module:
           - name: root
             dir: .
-            args: -exclude-dir=kek/awskms -exclude-dir=kek/gcpkms
+            args: -exclude-dir=kek/awskms -exclude-dir=kek/gcpkms -exclude-dir=examples
           - name: awskms
             dir: kek/awskms
             args: ""
           - name: gcpkms
             dir: kek/gcpkms
+            args: ""
+          - name: examples
+            dir: examples
             args: ""
     steps:
       - uses: actions/checkout@v7
@@ -70,6 +73,7 @@ jobs:
           govulncheck ./...
           govulncheck -C kek/awskms ./...
           govulncheck -C kek/gcpkms ./...
+          govulncheck -C examples ./...
 
   codeql:
     name: CodeQL
@@ -94,6 +98,7 @@ jobs:
           go build ./...
           go build -C kek/awskms ./...
           go build -C kek/gcpkms ./...
+          go build -C examples ./...
 
       - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@v4

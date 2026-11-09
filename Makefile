@@ -1,6 +1,6 @@
 .PHONY: build check fmt golangci govulncheck gosec lint test test-integration vet
 
-SUBMODULES := kek/awskms kek/gcpkms
+SUBMODULES := kek/awskms kek/gcpkms examples
 
 ## Run the full local check suite mirrored by CI and the security workflow.
 check: fmt vet golangci test build test-integration gosec govulncheck
@@ -16,7 +16,7 @@ vet:
 golangci:
 	golangci-lint run --timeout=5m
 	@for mod in $(SUBMODULES); do \
-		(cd "$$mod" && golangci-lint run --config=../../.golangci.yml --timeout=5m); \
+		(cd "$$mod" && golangci-lint run --config=$(CURDIR)/.golangci.yml --timeout=5m); \
 	done
 
 ## Run all tests with race detector and coverage across root module and sub-modules
@@ -50,7 +50,7 @@ lint: fmt vet golangci
 gosec:
 	tmp=$$(mktemp --suffix=.sarif); \
 	trap 'rm -f "$$tmp"' EXIT; \
-	gosec -no-fail -exclude-dir=kek/awskms -exclude-dir=kek/gcpkms -fmt sarif -out "$$tmp" ./...
+	gosec -no-fail -exclude-dir=kek/awskms -exclude-dir=kek/gcpkms -exclude-dir=examples -fmt sarif -out "$$tmp" ./...
 	@for mod in $(SUBMODULES); do \
 		tmp=$$(mktemp --suffix=.sarif); \
 		(cd "$$mod" && gosec -no-fail -fmt sarif -out "$$tmp" ./...) || { rm -f "$$tmp"; exit 1; }; \
