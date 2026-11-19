@@ -1,5 +1,17 @@
 # eventsalsa/encryption
 
+> [!WARNING]
+> **This repository has moved and is now archived.**
+>
+> Development has moved to the [`eventsalsa/eventsalsa`](https://github.com/eventsalsa/eventsalsa) monorepo at [`encryption/`](https://github.com/eventsalsa/eventsalsa/tree/main/encryption), published under the `eventsalsa.dev/encryption` Go vanity module path (starting at [`encryption/v0.1.0`](https://github.com/eventsalsa/eventsalsa/releases/tag/encryption/v0.1.0), plus submodules [`encryption/kek/awskms/v0.0.1`](https://github.com/eventsalsa/eventsalsa/releases/tag/encryption/kek/awskms/v0.0.1) and [`encryption/kek/gcpkms/v0.0.1`](https://github.com/eventsalsa/eventsalsa/releases/tag/encryption/kek/gcpkms/v0.0.1)):
+> ```bash
+> go get eventsalsa.dev/encryption@v0.1.0
+> ```
+> - **Source**: https://github.com/eventsalsa/eventsalsa/tree/main/encryption
+> - **Documentation**: https://eventsalsa.dev/documentation/components/encryption/
+> - **Go Reference**: https://pkg.go.dev/eventsalsa.dev/encryption
+> - **Issues & PRs**: https://github.com/eventsalsa/eventsalsa/issues
+
 KMS-native envelope encryption for Go systems — supporting **AWS KMS**, **Google Cloud KMS**, and **local symmetric KEKs**, with stateless PostgreSQL key storage, mandatory AAD scope binding, reusable in-memory sessions, and zero-downtime key rotation.
 
 ## Features
